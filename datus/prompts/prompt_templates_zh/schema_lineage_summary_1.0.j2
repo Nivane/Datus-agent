@@ -1,0 +1,31 @@
+# 最终表排名与排除分析
+
+## 目标
+根据用户的问题重新评估初步匹配的表，选出**最相关的表**，并对其余表进行分类，说明排除原因。当前数据库方言为 {{ dialect }}。
+
+## 输入数据
+1. 用户问题：{{ user_question }}
+2. 当前日期：{{ current_date }}
+2. 初步匹配结果：
+
+{{ table_metadata }}
+
+## 以 JSON 格式输出
+
+```json
+{
+  "matched": [
+    {
+      "table": "db.schema1.table1",
+      "score": 0.8,
+      "reasons": ["has 'order_date' field", "links to customers"]
+    }
+  ],
+  "unmatched": [
+    {
+      "table": "db.schema2.table2",
+      "reason": "no date/amount fields"
+    }
+  ]
+}
+```

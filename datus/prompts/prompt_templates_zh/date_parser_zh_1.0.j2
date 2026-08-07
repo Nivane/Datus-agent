@@ -1,0 +1,42 @@
+使用参考日期 {{ reference_date.strftime('%Y-%m-%d') }} 解析时间表达式 "{{ text }}"。
+
+重要规则：
+1. 对于基于时长（duration）的表达式（N天内/N天、N周内/N周、N个月内/N个月）：参考日期始终包含在时间范围内
+2. 对于基于周期（period）的表达式（上个月、去年、下个月、明年、上周、下周）：参考日期不包含在内——仅返回完整周期
+3. 对于 "未来N天内"：start_date = reference_date，end_date = reference_date + N days
+4. 对于 "最近N天"：start_date = reference_date - N days，end_date = reference_date
+5. 对于 "接下来N周"：start_date = reference_date，end_date = reference_date + (N × 7) days
+6. 对于 "最近N周"：start_date = reference_date - (N × 7) days，end_date = reference_date
+7. 对于 "未来N个月内"：start_date = reference_date，end_date = reference_date + N months
+8. 对于 "最近N个月"：start_date = reference_date - N months，end_date = reference_date
+9. 对于 "下个月"：返回完整的下个月（start = 下个月的第一天，end = 下个月的最后一天）
+10. 对于 "上个月"：返回完整的上个月（start = 上个月的第一天，end = 上个月的最后一天）
+11. 对于 "下周"：返回完整的下周（周一到周日）
+12. 对于 "上周"：返回完整的上周（周一到周日）
+13. 对于 "今年"：返回完整的当前年份（start = 1 月 1 日，end = 12 月 31 日）
+14. 对于包含 "现在"/"今天" 的表达式：将其视为参考日期
+15. 对于类似 "A到现在" 的表达式：end_date 应为参考日期
+16. 周的范围是周一到周日（周一 = 开始，周日 = 结束）
+
+返回 JSON 格式：
+{
+    "start_date": "YYYY-MM-DD",
+    "end_date": "YYYY-MM-DD"
+}
+
+示例：
+- "未来三个月内"，参考日期 2025-01-01 → start_date: "2025-01-01"，end_date: "2025-04-01"（基于时长）
+- "最近三个月"，参考日期 2025-01-01 → start_date: "2024-10-01"，end_date: "2025-01-01"（基于时长）
+- "下个月"，参考日期 2025-01-15 → start_date: "2025-02-01"，end_date: "2025-02-28"（基于周期）
+- "上个月"，参考日期 2025-01-15 → start_date: "2024-12-01"，end_date: "2024-12-31"（基于周期）
+- "未来30天内"，参考日期 2025-01-01 → start_date: "2025-01-01"，end_date: "2025-01-31"（基于时长）
+- "最近7天"，参考日期 2025-01-01 → start_date: "2024-12-25"，end_date: "2025-01-01"（基于时长）
+- "上周"，参考日期 2025-02-15（周六）→ start_date: "2025-02-03"（周一），end_date: "2025-02-09"（周日）（基于周期）
+- "下周"，参考日期 2025-02-15（周六）→ start_date: "2025-02-17"（周一），end_date: "2025-02-23"（周日）（基于周期）
+- "接下来两周"，参考日期 2025-02-15 → start_date: "2025-02-15"，end_date: "2025-03-01"（基于时长）
+- "最近两周"，参考日期 2025-02-15 → start_date: "2025-02-01"，end_date: "2025-02-15"（基于时长）
+- "今年"，参考日期 2025-06-15 → start_date: "2025-01-01"，end_date: "2025-12-31"（基于周期）
+- "从上个月到下个月"，参考日期 2025-01-15 → start_date: "2024-12-01"，end_date: "2025-02-28"
+- "2024年底到现在"，参考日期 2025-01-15 → start_date: "2024-12-31"，end_date: "2025-01-15"
+
+对于单个日期，start_date 和 end_date 使用相同的日期。

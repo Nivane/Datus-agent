@@ -1,0 +1,14 @@
+{# 数据源级运行时上下文，仅附加到其工具面（tool surface）
+   可作用于数据库/SQL 文件上下文的节点。这些值会被固化到
+   按会话保存的系统提示词快照中。*当前*数据源的选择及其
+   方言不在其中——它们是按轮次动态注入到用户消息的
+   ``<system_reminder>`` 信封中的实时值，以便会话中途切换数据源
+   仍能保持正确，同时不会使缓存的提示词前缀失效。#}
+数据源上下文：
+{% if available_datasources and available_datasources|length > 0 -%}
+- 可用数据源：{% for ds_name, ds_type in available_datasources.items() %}{{ ds_name }} ({{ ds_type }}){% if not loop.last %}, {% endif %}{% endfor %}
+
+{% endif -%}
+{% if workspace_root -%}
+- 当前 SQL 文件根目录：{{ workspace_root }}
+{% endif -%}

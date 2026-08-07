@@ -1,0 +1,8 @@
+{# 由 ``_finalize_system_prompt`` 统一追加的共享运行时上下文块。
+   包含每个智能体节点都可能需要的会话级稳定上下文。数据源
+   目录和 sql-root 提示信息位于 ``datasource_runtime_context`` 中，因此日期
+   注入不需要也不暗示数据库工具能力。 #}
+当前上下文：
+{% if current_date -%}
+- 当前日期：{{ current_date }}
+{% endif -%}

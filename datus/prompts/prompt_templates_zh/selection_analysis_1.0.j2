@@ -1,0 +1,43 @@
+请分析以下候选结果并选出最佳的一个。
+
+候选结果：
+
+{% for candidate_id, candidate in candidates.items() %}
+{{ candidate_id }}:
+{% if candidate is mapping %}
+- 成功：{{ candidate.get('success', false) }}
+- 状态：{{ candidate.get('status', 'unknown') }}
+{% if candidate.get('result') %}
+{% set result = candidate.get('result') %}
+{% if result.sql_result_final is defined %}
+- SQL 结果：{{ result.sql_result_final }}
+{% endif %}
+{% if result.gen_sql_final is defined %}
+- 生成的 SQL：{{ result.gen_sql_final }}
+{% endif %}
+{% endif %}
+{% if candidate.get('error') %}
+- 错误：{{ candidate.get('error') }}
+{% endif %}
+{% else %}
+- 原始结果：{{ candidate | string }}
+{% endif %}
+
+{% endfor %}
+
+请根据以下标准进行评估并选出最佳候选结果：
+1. 无错误地成功执行
+2. 结果的质量和完整性
+3. 生成内容的正确性
+4. 整体可靠性
+
+请以 JSON 格式返回结果：
+{
+    "best_candidate": "所选最佳候选结果的 ID",
+    "reason": "选择的详细原因",
+    "score_analysis": {
+        "candidate1": {"score": 评分(1-10), "reason": "评分原因"},
+        "candidate2": {"score": 评分(1-10), "reason": "评分原因"},
+        ...
+    }
+}

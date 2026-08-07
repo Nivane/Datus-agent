@@ -1,0 +1,41 @@
+使用参考日期 {{ reference_date.strftime('%Y-%m-%d') }} 解析时间表达式 "{{ text }}"。
+
+重要规则：
+1. 对于基于时长（duration）的表达式（last/next N days、last/next N weeks、last/next N months）：参考日期始终包含在时间范围内
+2. 对于基于周期（period）的表达式（last month、last year、next month、next year、last week、next week）：参考日期不包含在内——仅返回完整周期
+3. 对于 "next N days"（未来 N 天）：start_date = reference_date，end_date = reference_date + N days
+4. 对于 "last N days"（过去 N 天）：start_date = reference_date - N days，end_date = reference_date
+5. 对于 "next N weeks"（未来 N 周）：start_date = reference_date，end_date = reference_date + (N × 7) days
+6. 对于 "last N weeks"（过去 N 周）：start_date = reference_date - (N × 7) days，end_date = reference_date
+7. 对于 "next N months"（未来 N 个月）：start_date = reference_date，end_date = reference_date + N months
+8. 对于 "last N months"（过去 N 个月）：start_date = reference_date - N months，end_date = reference_date
+9. 对于 "next month"（下个月）：返回完整的下个月（start = 下个月的第一天，end = 下个月的最后一天）
+10. 对于 "last month"（上个月）：返回完整的上个月（start = 上个月的第一天，end = 上个月的最后一天）
+11. 对于 "next week"（下周）：返回完整的下周（周日到周六）
+12. 对于 "last week"（上周）：返回完整的上周（周日到周六）
+13. 对于 "this year"（今年）：返回完整的当前年份（start = 1 月 1 日，end = 12 月 31 日）
+14. 对于包含 "now"/"today"（现在/今天）的表达式：将其视为参考日期
+15. 对于类似 "A to now"（A 到现在）的表达式：end_date 应为参考日期
+16. 周的范围是周日到周六（周日 = 开始，周六 = 结束）
+
+返回 JSON 格式：
+{
+    "start_date": "YYYY-MM-DD",
+    "end_date": "YYYY-MM-DD"
+}
+
+示例：
+- "next three months"（未来三个月），参考日期 2025-01-01 → start_date: "2025-01-01"，end_date: "2025-04-01"（基于时长）
+- "last three months"（过去三个月），参考日期 2025-01-01 → start_date: "2024-10-01"，end_date: "2025-01-01"（基于时长）
+- "next month"（下个月），参考日期 2025-01-15 → start_date: "2025-02-01"，end_date: "2025-02-28"（基于周期）
+- "last month"（上个月），参考日期 2025-01-15 → start_date: "2024-12-01"，end_date: "2024-12-31"（基于周期）
+- "next 30 days"（未来 30 天），参考日期 2025-01-01 → start_date: "2025-01-01"，end_date: "2025-01-31"（基于时长）
+- "last 7 days"（过去 7 天），参考日期 2025-01-01 → start_date: "2024-12-25"，end_date: "2025-01-01"（基于时长）
+- "last week"（上周），参考日期 2025-01-15（周三）→ start_date: "2025-01-05"（周日），end_date: "2025-01-11"（周六）（基于周期）
+- "last two weeks"（过去两周），参考日期 2025-01-15（周三）→ start_date: "2025-01-01"，end_date: "2025-01-15"（基于时长）
+- "next week"（下周），参考日期 2025-01-15（周三）→ start_date: "2025-01-19"（周日），end_date: "2025-01-25"（周六）（基于周期）
+- "this year"（今年），参考日期 2025-06-15 → start_date: "2025-01-01"，end_date: "2025-12-31"（基于周期）
+- "from last month to next month"（从上个月到下个月），参考日期 2025-01-15 → start_date: "2024-12-01"，end_date: "2025-02-28"
+- "from end of 2024 to now"（从 2024 年底到现在），参考日期 2025-01-15 → start_date: "2024-12-31"，end_date: "2025-01-15"
+
+对于单个日期，start_date 和 end_date 使用相同的日期。

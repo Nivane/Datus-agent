@@ -1,0 +1,31 @@
+数据库类型：{{ database_type }}
+数据库名称：{{ database_name }}
+
+SQL 任务：{{ sql_task }}
+
+{% if external_knowledge %}
+外部知识（重要，请考虑）：{{ external_knowledge }}
+{% endif %}
+
+当前 SQL 查询：
+```sql
+{{ sql_query }}
+```
+
+{% if sql_explanation %}
+SQL 说明：{{ sql_explanation }}
+{% endif %}
+
+{% if sql_error %}
+SQL 错误：{{ sql_error }}
+{% endif %}
+
+{% if sql_result %}
+当前 SQL 结果：
+{{ sql_result }}
+{% endif %}
+
+预期：
+{{ expectation }}
+
+请分析当前 SQL 查询与预期之间的差异，并提供改进建议。

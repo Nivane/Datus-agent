@@ -1,0 +1,15 @@
+SQL 任务: {{sql_task}}
+
+SQL 上下文: {{sql_context}}
+
+表 schema: {{schemas}}
+
+外部文档: {{docs}}
+
+使用 SQL 方言来解释查询，分析 SQL 查询和执行结果，并考虑 SQL 任务。
+你的工作是在保持查询原始意图的同时修复查询中的语法错误。 
+输出格式：返回一个具有以下结构的 JSON 对象，*仅 JSON*：
+{
+  "sql": "你生成的 sql", 
+  "explanation" : "逐步思考"
+} 

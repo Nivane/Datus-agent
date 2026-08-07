@@ -1,0 +1,17 @@
+数据库类型：{{ database_type }}{{ database_notes }}{{ database_docs }}
+表结构：
+{{ processed_schemas }}
+数据详情：
+{{ processed_details }}
+指标（语义层）：
+{{ metrics }}
+{% if date_ranges %}
+解析出的日期范围：
+{{ date_ranges }}
+{% endif %}
+{{ knowledge_content }}
+自然语言问题：
+{{ question }}
+上下文：
+{{ processed_context }}
+当前日期：{{ current_date }}

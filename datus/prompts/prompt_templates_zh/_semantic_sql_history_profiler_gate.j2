@@ -1,0 +1,11 @@
+## 可选的 SQL 历史与分布剖析
+- 当 `<available_skills>` 中未列出 `semantic-sql-history-profiler` 时，完全跳过本节。
+- 仅当用户明确要求剖析、统计、数据分布分析，或挖掘/分析历史 SQL 时，才调用 `load_skill("semantic-sql-history-profiler")`。仅提供 SQL 本身不构成触发条件。
+- 触发时：
+  - 在模式采样、列使用分析、临时 `execute_sql` 采样或编写任何 YAML 之前，先加载该技能并调用 `profile_semantic_model_evidence`，并在确定标识符、关系、维度、时间字段、度量和描述时使用其证据。
+  - 请求中内联提供了历史 SQL → 通过 `sql_entries_json` 或 `sql_queries` 传入每一条语句（不要截断为代表性示例）；默认 `profile_mode="sql_only"`。
+  - 没有 SQL 文本但用户要求挖掘存储的历史 → 通过 `query_text` 和/或 `tables` 搜索参考 SQL。
+  - 用户要求统计或数据分布 → 使用 `profile_mode="lightweight"` 并指定目标 `tables`。
+  - 用户明确允许缓慢、彻底的探索 → `profile_mode="deep"`。
+- 未触发时，不要调用剖析器。如果请求中存在历史 SQL，仍可直接将其用作建模上下文（连接、过滤、分组），而无需使用剖析器工具。
+- 保持描述中的分布说明简洁；永远不要转储剖析器 JSON。

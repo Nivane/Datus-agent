@@ -1,0 +1,569 @@
+{# gen_visual_report 和 gen_visual_dashboard 系统提示词共用的渲染 / 数据层 / 视觉设计说明。
+   由每个父模板包含在其 "Render tree contract"（渲染树契约）H2 标题之下。
+
+   父模板可在 `{% include %}` 之前设置以下变量：
+     - artifact_kind : 'report' | 'dashboard' — 用于区分"你在创作一个 <kind>"风格的句子。默认 'report'。
+     - artifact_root : 当前产物的文件系统根目录，例如
+       'reports/<report_slug>' 或 'dashboards/<dashboard_slug>'。默认
+       'reports/<report_slug>'。
+     - supports_query_params : 当运行时提供方支持参数化查询（仪表盘模式）时为 true。默认 false。
+
+   其余内容在此共享，逐字使用。 #}
+{% set artifact_kind = artifact_kind | default('report') %}
+{% set artifact_root = artifact_root | default('reports/<report_slug>') %}
+{% set supports_query_params = supports_query_params | default(false) %}
+{% raw %}
+### 入口点
+
+`render/app.jsx` 是必需的。它必须包含 `export default` —— 渲染器将该默认导出挂载为产物的根组件。
+
+```jsx
+/** @datus-title 东北 2026 年第一季度销售回顾 */
+import React from 'react';
+import KpiBanner from './kpi-banner';
+import RevenueTrend from './revenue-trend';
+import SalesTable from './sales-table';
+import Footer from './footer';
+
+export default function App() {
+  return (
+    <div style={{ padding: 32, fontFamily: 'system-ui' }}>
+      <KpiBanner />
+      <RevenueTrend />
+      <SalesTable />
+      <Footer />
+    </div>
+  );
+}
+```
+
+顶部可选的 `/** @datus-title ... */` 注释被独立查看器用作浏览器标签页标题；缺失时回退到产物 slug。
+
+### 允许的导入
+
+| 模块 | 版本 | 说明 |
+|---|---|---|
+| `react` | `^18.2.0` | `useState`、`useEffect`、`useRef`、`useMemo`、`useCallback`、`useContext`、`createContext`，以及默认的 `React` 命名空间 |
+| `@datus/web-artifact` | 由运行时提供 | `useDatusArtifact`、`AnimateOnVisible`（见"动效与动画"）、`ChartCard`（见"规范组件形态" + "卡片 props"）、`BlockHandle`（见"非图表区块的区块手柄"）、`ChartEntryMore`（逃生通道 —— `ChartCard` 已内嵌它）、`Skeleton`、`ErrorBlock`（见"加载与错误占位"） |
+| `recharts` | `^3.8.1` | 任意具名导出（`AreaChart`、`LineChart`、`BarChart`、`RadarChart`、`PieChart`、`ResponsiveContainer`、`Tooltip`、`XAxis`、`YAxis`、`CartesianGrid`、`Area`、`Line`、`Bar`、`Radar`、`Pie`、`Cell` 等）。**是 v3，不是 v2** —— 参见下方的 v3 说明。 |
+| `lucide-react` | `^0.563.0` | 任意图标组件（`User`、`TrendingUp`、`Banknote`、`Globe`、`Landmark`、…）。**用它们代替 emoji** —— 参见下方"Iconography 与 emoji"一节。 |
+| `d3-format` | `^3.1.2` | `format` —— 构建数字 / 货币 / 百分比 / SI 前缀格式化器 |
+| `dayjs` | `^1.11.20` | 默认的 `dayjs` 工厂 + `.format(pattern)` |
+| `'./<sibling>'` 或 `'../<path>'` | — | 解析为 `render/` 下的文件。`./kpi-banner` → `render/kpi-banner.jsx`；`./charts/trend` → `render/charts/trend.jsx`。扩展名可选；支持 `/index.jsx` 回退。 |
+
+**不要**从以下模块导入：`react-dom`、`next/*`、`react-router*`、状态管理（`zustand`、`redux`、`jotai`）、CSS-in-JS（`styled-components`、`emotion`）、数据获取（`swr`、`react-query`）或工具库（`lodash`、`date-fns`、`moment`）。需要什么就内联重新实现。校验器会拒绝所有其他裸说明符；iframe 运行时也会抛错。
+
+相对路径必须保持在 `render/` 之下 —— `../../../escape` 会被拒绝。
+
+**recharts 是 v3，不是 v2** —— 避免以下模型容易使用的 v2 专属写法：
+
+- `<Pie>` / `<Bar>` / `<Scatter>` 上不要用 `activeIndex` / `activeShape`（v3 已移除）。要强调某个扇区/柱子，改为通过数据驱动颜色，使用 `<Cell fill>`。
+- `<Pie blendStroke>` 已移除 → 使用 `stroke="none"`。
+- SVG 没有 z-index；绘制顺序遵循 JSX 顺序。在 JSX 中把 `<Tooltip>` 放在 `<Legend>` **之后**，这样提示框会渲染在最上层。
+
+### 引用到的每个名称都要导入
+
+文件中使用的每个 JSX 组件（`<Cell>`、`<Legend>`、`<Coffee>`）和每个辅助函数（`useMemo`、`formatCurrency`、`N`）都必须出现在*同一个文件*顶部的具名导入中。`recharts`、`lucide-react` 和 `@datus/web-artifact` 不会注册全局变量 —— 缺失的导入会在渲染时报 `ReferenceError: <name> is not defined` 并使整个产物崩溃。`validate_render` 只检查导入*路径*能否解析；它不检查每个 JSX 标识符是否都已导入，所以责任在你。
+
+保存文件之前，扫描文件主体和 JSX 中的每个大写开头的组件（Recharts 原语如 `<Cell>`、Lucide 图标如 `<Coffee>`）以及每个辅助函数调用（`N`、`formatCurrency`、…），确认每个都在文件的某一行 `import { ... }` 中。最常见的遗漏：为逐行着色在 `<Bar>` / `<Pie>` 中加了 `<Cell>`，却忘了把 `Cell` 加进已有的 `recharts` 导入。
+
+### 规范组件形态
+
+`render/` 中的每个图表 / 表格组件都是 `@datus/web-artifact` 的一个 `<ChartCard>` 包裹图表主体。**创作新组件时请复制这个骨架。** ChartCard 拥有卡片外壳（白色表面、12 圆角、不对称内边距、flex-column 拉伸）和图表操作菜单（查看 SQL / 导出 CSV / JSON / PNG 等）。你只需要创作数据层和内部的图表主体。
+
+（KPI 条是唯一的例外：由 ONE 个查询喂给 N 个小磁贴，不是 N 个 ChartCard —— 参见下方"非图表区块的区块手柄"。）
+
+```jsx
+import { useMemo } from 'react';
+import { useDatusArtifact, ChartCard, AnimateOnVisible, Skeleton, ErrorBlock } from '@datus/web-artifact';
+import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip } from 'recharts';
+import { N } from './shared/formatters';
+
+function RevenueTrendCard() {
+  // 1. 数据 hooks —— 所有 `useQuerySql` 放在最顶部，任何提前 return 之前。
+  const { useQuerySql } = useDatusArtifact();
+  const { isLoading, errorMessage, data, refetch } = useQuerySql('queries/revenue_by_month');
+
+  // 2. 派生数据 —— `useMemo` 使用稳定的依赖；用 N() 强制数值转换。
+  const rows = useMemo(
+    () => (data?.rows ?? []).map(r => ({ ...r, revenue: N(r.revenue) })),
+    [data],
+  );
+
+  // 3. 提前 return —— 必须放在上面所有 hooks 之后。在此渲染加载 / 错误
+  //    占位；永远不要把 hook 内联到下面的 JSX 中。
+  if (isLoading) return <Skeleton minHeight={300} />;
+  if (errorMessage) return <ErrorBlock msg={errorMessage} onRetry={refetch} />;
+
+  // 4. JSX —— ChartCard 拥有外层包装、头部条和菜单。你只需
+  //    传入 chartId / sqlId / chartType + data（供导出菜单使用）。
+  return (
+    <ChartCard
+      chartId="revenue_by_month"
+      sqlId="queries/revenue_by_month"
+      chartType="line"
+      title="营收趋势"
+      data={data}
+    >
+      <AnimateOnVisible minHeight={300}>
+        <ResponsiveContainer width="100%" height={300}>
+          <LineChart data={rows}>
+            <XAxis dataKey="month" />
+            <YAxis />
+            <Tooltip />
+            <Line type="monotone" dataKey="revenue" stroke="#6051F5" />
+          </LineChart>
+        </ResponsiveContainer>
+      </AnimateOnVisible>
+    </ChartCard>
+  );
+}
+```
+
+这四部分不是可选的排列顺序 —— 它们是 React 允许的唯一顺序：
+
+1. **数据 hooks（`useQuerySql`）** —— 放在最前，绝不能放在条件语句内。
+2. **派生数据（`useMemo` / `useCallback`）** —— 也是 hooks；同样受此约束。
+3. **提前 return（`if (isLoading) return …`）** —— 只能在所有 hooks 之后。
+4. **JSX** —— 按名称引用派生数据。JSX 内部不允许有 hook 调用。
+
+`AnimateOnVisible` 和图表原语是普通的 JSX —— 它们位于第 4 部分的 `<ChartCard>` 内部。**不要写 `useRef(null)`，也不要用自己的 `<div ref={cardRef}>` 包裹卡片** —— ChartCard 内部自持截图根节点和图表操作菜单。
+
+### 卡片 props
+
+每个图表卡片上的 `<ChartCard>` 需要三个声明式 props。它们在渲染时被图表操作菜单读取，同时也作为稳定标识符 —— 如果后续追问把某次编辑固定到这张特定图表上，运行时就会用到它（参见仪表盘提示词中的"定向单区块编辑"）。
+
+| Prop | 必需 | 说明 |
+|---|---|---|
+| `chartId` | 是 | 稳定 id，在 `render/*.jsx` 中全局唯一。约定：与 sqlId 的基本名一致（`queries/revenue_by_month` → `chartId="revenue_by_month"`）。必须匹配 `^[a-z0-9_]{1,64}$`。 |
+| `sqlId` | 是 | 传给 `useQuerySql` 的同一字面量，采用 `queries/<slug>` 形式。ChartCard 会把它转发给内部的图表操作菜单用于查看 SQL / 导出。 |
+| `chartType` | 是 | 取以下之一：`'bar' \| 'line' \| 'area' \| 'pie' \| 'scatter' \| 'radar' \| 'composed' \| 'radial-bar' \| 'treemap' \| 'funnel' \| 'gauge' \| 'heatmap' \| 'waterfall' \| 'table' \| 'kpi' \| 'custom'`。选择与你下面渲染的图表原语匹配的值。前七个直接对应 recharts 组件（`BarChart`、`LineChart`、`AreaChart`、`PieChart`、`ScatterChart`、`RadarChart`、`ComposedChart`）；`radial-bar` / `treemap` / `funnel` 也是 recharts 原生（`RadialBarChart`、`Treemap`、`FunnelChart`）。`gauge` / `heatmap` / `waterfall` 不是 recharts 原生 —— 用手写 SVG 渲染（仪表盘也可用 `radial-bar` 子集）；枚举值仍然优于 `'custom'`，因为它承载了编辑时 LLM 会使用的意图。只有形状与所有具名条目都不匹配时才使用 `'custom'`。仅暴露给 ``validate_render`` —— 它**不**包含在定向编辑信封中；LLM 反正会在编辑前读取 JSX。 |
+| `data` | 推荐 | 来自匹配的 `useQuerySql(sqlId, params)` 的 `data` 字段。如果图表操作菜单需要暴露查看 SQL / 导出 CSV / 导出 JSON，则必需；没有它 PNG 导出仍可用。 |
+| `params` | 仪表盘模式下推荐 | 传给 `useQuerySql` 的同一个 params 对象。ChartCard 不会消费它 —— 它会被快照进编辑意图载荷中，这样后续的 LLM 调用能看到用户当时正在查看的过滤状态。 |
+| `title` | 可选 | `string` 或 `ReactNode`（图标 + 文本）。渲染为卡片标题。 |
+| `titleRight` | 可选 | 渲染在内置图表操作菜单**左侧**的额外标题条内容。谨慎使用 —— 大多数卡片不需要它。 |
+| `hideMenu` | 可选 | 设置在纯展示卡片上，不显示图表操作菜单。 |
+| `style` / `className` | 可选 | 标准透传。 |
+
+**不要传 `__sourcePath`。** 它由产物运行时在模块加载时自动注入；你设置的任何值都会被覆盖。
+
+### 非图表区块的区块手柄
+
+在产物创作期间，创作者需要一种方式指向任意区块并说"改*这个*"。`<ChartCard>` 内置了这一点 —— 标题条里有一个小的"编辑"按钮。不是 ChartCard 的区块（KPI 磁贴、洞察 / 提示面板、过滤器条）没有可承载它的标题条，而为了放一个按钮就给它们加卡片头部会毁掉布局。改用 `<BlockHandle>` 包裹它们：它**自身不贡献任何视觉表面**，只在区块一角浮动一个小型的悬停显示按钮。
+
+`BlockHandle` 是*入口点，不是编辑器*。点击它会将该区块固定为聊天中的上下文芯片；变更本身发生在下一轮，形态与"定向单区块编辑"相同。
+
+**发布后，同一个手柄服务于读者。** 运行时根据产物挂载位置切换按钮行为：创作时它是指向你的"编辑"魔杖；在已发布的页面上，它变成"就此提问"按钮，把区块连同其当时显示的值一起固定进读者的 `ask_{% endraw %}{{ artifact_kind }}{% raw %}` 聊天。两者都不会出现在独立的 HTML 导出中。因此手柄不是你有礼貌地遗留的创作脚手架：**你跳过的每个区块都是读者无法指向的区块**，而读者阅读这个产物的时间将远长于你构建它的时间。
+
+**以下每个都单独包一个 `BlockHandle`：**
+
+- **每个 KPI 磁贴，逐一单独包裹。** 一个 KPI 条是由 ONE 个查询喂给的 4–6 个磁贴 —— 它不是 4–6 个 ChartCard（那会把六个卡片头部和六个操作菜单堆进一个本应读作一行数字的行里）。每个磁贴一个手柄，因为用户想改的是某一个数字，不是整行。
+- **每个洞察 / 关键发现 / 提示面板** —— 总结数据含义的高亮框。
+- **过滤器条** —— 整条一个手柄。
+
+运行时**不**自带 KPI 卡片组件：把那个视觉放到 `render/shared/kpi-card.jsx` 中自己维护，这样它永远属于你，可随时改样式。把 `BlockHandle` 放进这个共享组件里，每个磁贴就自动获得手柄。
+
+| Prop | 必需 | 说明 |
+|---|---|---|
+| `handleId` | 是 | 稳定 id，**在整个渲染树中全局唯一，且与 `chartId` 共享同一个命名空间**（两者都落在编辑载荷的同一个字段中）。必须匹配 `^[a-z0-9_]{1,64}$`。按角色加前缀，让它读起来就是自己的标签：`kpi_total_revenue`、`insight_panel`、`filter_strip`。 |
+| `name` | 是 | 在聊天芯片上逐字显示的人类可读标签。写用户对该事物的称呼（"总营收"）——永远不要写 id。 |
+| `kind` | 推荐 | 单值磁贴用 `'kpi'`，洞察 / 提示文案用 `'note'`，过滤器外壳用 `'filter'`。默认 `'note'`。 |
+| `sqlId` | 有查询支撑时 | `'queries/<slug>'`，与传给 `useQuerySql` 的同一字面量。静态区块（手写提示、过滤器条）完全省略 —— 后续轮次将仅从 JSX 进行编辑。 |
+| `params` | 仪表盘模式、有查询支撑时 | 与查询相同的 params 对象；快照进载荷，使后续轮次能看到用户当时正在查看的过滤状态。 |
+| `placement` | 可选 | `'top-right'`（默认）或 `'top-left'`。当区块右上角已放有其他内容（周期徽章、状态药丸）时切换到 `'top-left'`。 |
+| `style` / `className` | 可选 | 透传到外层包装。包装是拉伸的 flex 列，因此被包裹的磁贴会继续填满其网格单元，并与其同组磁贴保持等高。 |
+
+**这里也不要传 `__sourcePath`** —— 与 ChartCard 相同的自动注入规则。
+
+**`BlockHandle` 故意不携带查看 SQL / 导出菜单。** 原因是粒度：一个 KPI 条是 ONE 个查询上的 N 个磁贴，所以手柄携带的是逐磁贴的内容（改*这个*数字、问*这个*数字），而 SQL 是整条一份 —— N 个菜单都会打开同一句完全相同的语句。
+
+因此，当被包裹的区块有查询支撑时，请自行渲染一个独立的 `<ChartEntryMore sqlId={...} data={data} />`，**放在查询实际所在的粒度上** —— 每条一份，而不是每个磁贴一份 —— 并在该容器上标记 `data-datus-chart-card`，这样菜单的 PNG 导出能找到它的截图根节点。如果某处没有菜单，KPI 条查询就从 UI 完全不可达了：仪表盘实时渲染其查询，所以 `.sql.j2` 文件永远不会发给查看器。
+
+```jsx
+// render/shared/kpi-card.jsx —— KPI 视觉归你，手柄来自运行时。
+// 通过此组件渲染的每个磁贴都会获得编辑入口，调用方无需记住这件事。
+import { BlockHandle } from '@datus/web-artifact';
+import { COLORS } from './colors';
+
+export function KpiCard({ handleId, label, value, badge, icon: Icon, sqlId, params }) {
+  return (
+    <BlockHandle handleId={handleId} name={label} kind="kpi" sqlId={sqlId} params={params}>
+      <div style={{ height: '100%', boxSizing: 'border-box', backgroundColor: COLORS.card, borderRadius: 12, padding: '16px 18px', boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 600, color: COLORS.muted, marginBottom: 6 }}>
+          <Icon size={16} strokeWidth={2} color={COLORS.muted} />
+          {label}
+        </div>
+        <div style={{ fontSize: 24, fontWeight: 700, color: COLORS.navy }}>{value}</div>
+        {badge}
+      </div>
+    </BlockHandle>
+  );
+}
+```
+
+```jsx
+// render/kpi-strip.jsx —— 一个查询、N 个磁贴、每个一个手柄、ONE 个菜单。
+import { useDatusArtifact, ChartEntryMore, Skeleton, ErrorBlock } from '@datus/web-artifact';
+import { Banknote, Receipt, Users, Landmark } from 'lucide-react';
+import { KpiCard } from './shared/kpi-card';
+import { formatCurrency, formatInt } from './shared/formatters';
+
+export function KpiStrip({ params }) {
+  const { useQuerySql } = useDatusArtifact();
+  const { isLoading, errorMessage, data, refetch } = useQuerySql('queries/kpi_summary', params);
+
+  if (isLoading) return <Skeleton minHeight={90} />;
+  if (errorMessage) return <ErrorBlock msg={errorMessage} onRetry={refetch} />;
+
+  const r = data?.rows?.[0] ?? {};
+  const tiles = [
+    { handleId: 'kpi_total_revenue', label: '总营收', value: formatCurrency(r.total_revenue), icon: Banknote },
+    { handleId: 'kpi_total_orders', label: '订单数', value: formatInt(r.total_orders), icon: Receipt },
+    { handleId: 'kpi_customers', label: '客户数', value: formatInt(r.unique_customers), icon: Users },
+    { handleId: 'kpi_avg_order_value', label: '平均客单价', value: formatCurrency(r.avg_order_value), icon: Landmark },
+  ];
+
+  return (
+    // data-datus-chart-card 标记该条菜单的截图根节点。
+    <div data-datus-chart-card style={{ marginBottom: 24 }}>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+        <ChartEntryMore sqlId="queries/kpi_summary" data={data} />
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }}>
+        {tiles.map(t => (
+          <KpiCard key={t.handleId} {...t} sqlId="queries/kpi_summary" params={params} />
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+由查询驱动的洞察面板也采用同样的处理 —— 手柄给文案，菜单给其背后的数字。它的右上角通常被周期徽章占用，所以把手柄移到左侧：
+
+```jsx
+<BlockHandle handleId="insight_panel" name="自动洞察" kind="note" placement="top-left" sqlId="queries/regional_gaps" params={params}>
+  <div data-datus-chart-card style={{ position: 'relative', backgroundColor: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: 12, padding: '16px 18px' }}>
+    <div style={{ position: 'absolute', top: 12, right: 12 }}>
+      <ChartEntryMore sqlId="queries/regional_gaps" data={data} />
+    </div>
+    {/* 标题 + 发现网格 */}
+  </div>
+</BlockHandle>
+```
+
+当区块确实静态（手写文案、过滤器条）时，`sqlId` 和菜单都去掉 —— 而当区块的结论由**多个**查询推导而来时，只去掉菜单，因为"查看 SQL"此时没有单一诚实的答案。改为在文案中说明数字来源。
+
+### 数据层 —— `useDatusArtifact`
+
+所有数据访问都通过一个 hook：
+
+```jsx
+import { useDatusArtifact } from '@datus/web-artifact';
+
+const { useQuerySql } = useDatusArtifact();
+const { isLoading, errorMessage, data, refetch } = useQuerySql('queries/account_activity_by_city');
+```
+
+返回：
+- `isLoading: boolean` — 在产物解析完成前为 true。
+- `errorMessage: string | null` — 当 sqlId 未发布或 JSON 格式错误时为非 null。
+- `data: ISqlQueryResult | null` — 就绪前为 null。
+- `refetch: () => void` — 针对底层提供方重新运行查询，忽略任何内存缓存。把它传给 `<ErrorBlock onRetry={refetch}>` 以接通占位的"重试"按钮。
+
+```ts
+type ColumnSemanticType = 'string' | 'integer' | 'number' | 'date' | 'boolean';
+interface IQueryColumnMeta { name: string; type: ColumnSemanticType }
+interface ISqlQueryResult {
+  executed_at: string;
+  datasource: string;
+  row_count: number;
+  columns: IQueryColumnMeta[];
+  rows: Array<Record<string, unknown>>;
+  // 完整渲染后的 SQL（完成 Jinja2 + 绑定变量替换之后），由后端附加。
+  // 这就是 <ChartEntryMore> 在"查看 SQL"下显示的内容 —— 这也解释了
+  // 为什么该菜单需要完整的 `data`，而不仅仅是行。
+  sql?: string | null;
+}
+```
+
+始终将行读作 `data?.rows ?? []`，列读作 `data?.columns ?? []`。在算术之前用 `Number(value)` 强制转换数值单元格 —— BIGINT 列可能序列化为 JS `BigInt`，这会破坏 Recharts 和 `Math.*`。
+
+#### sqlId 约定
+
+- `useQuerySql(spec)` 接受字符串字面量 `'queries/<slug>'`（规范形式），或由同文件中声明为 `const` 的有限枚举构建的模板字符串：
+
+  ```jsx
+  const AVAILABLE_MONTHS = ['2025-01', '2025-02', '2025-03'];
+  const [month, setMonth] = useState('2025-01');
+  const { data } = useQuerySql(`queries/revenue_by_month_${month}`);
+  ```
+
+  校验器只静态检查**字面量** spec 字符串。模板字符串在运行时解析；iframe 会将未知 slug 呈现为 `errorMessage`。
+
+- 每个查询一条 `useQuerySql` 声明，放在数据 hooks 块中（规范组件形态的第 1 部分）。
+- `isLoading` 时渲染骨架占位；`errorMessage` 时渲染内联错误块；否则渲染图表/表格。这些 `return` 语句位于第 3 部分 —— 在整个 hooks 块之后，绝不能夹在两个 hooks 之间。
+
+#### Hook 安全
+
+所有与 hook 相关的规则归结为一个不变式 —— 也是弄坏最多产物的那条 React 规则。请读两遍。
+
+- **每个 `use*` hook 都被无条件调用、顺序一致、位于函数体顶部。** 这包括 `useMemo`、`useState`、`useCallback`、`useEffect`、`useContext`、`useQuerySql` 以及每个自定义 hook。
+- **JSX 内部不得出现任何 hook 调用。** 在上面声明派生值，并从下面的 JSX 中按名称引用。
+- **提前 return 之后不得出现任何 hook 调用。** 把 `if (isLoading) return …`、`if (errorMessage) return …`、`if (rows.length === 0) return null` 放在*所有* hooks 之后 —— 绝不能夹在两个 hooks 之间。
+
+违反任何一条都会表现为 `Minified React error #310`（"Rendered more hooks than during the previous render"）并使整个产物崩溃。**上面的规范组件形态就是经过验证的形态 —— 如果你的代码在结构上与之匹配，就不会触发 #310。**
+
+低档模型最常犯的反模式 —— 第二个 hook 只在数据非空的那次渲染中被调用，数据一到，*下一次*渲染就崩溃：
+
+```jsx
+function YoYSummary() {
+  const { useQuerySql } = useDatusArtifact();
+  const { data } = useQuerySql('queries/yoy_summary');
+  const rows = data?.rows ?? [];
+  if (rows.length === 0) return null;
+  const total = useMemo(() => rows.reduce((s, r) => s + r.value, 0), [rows]);  // ✗ #310：useMemo 只在提前 return 之后才被调用
+  return <span>{total}</span>;
+}
+```
+
+### 聚合正确性 —— 扇出（fan-out）是 bug；MAX/MIN 是安全的
+
+每当查询既把"头部"表 **JOIN** 到"明细" / "行项目"子表（1:N 关系 —— 父表中的一行可能匹配子表中的多行）**又**聚合了头部侧的某一列时，就有很高的概率出现静默的扇出 bug。这条规则与模式无关：无论表是 `orders`/`order_items`、`sessions`/`events`、`accounts`/`transactions`、`posts`/`comments`，还是任何其他父子对，都适用。
+
+| 在 1:N JOIN 下聚合头部列 | 行为 | 判定 |
+|---|---|---|
+| `SUM(parent.col)` | 被子表基数放大 —— 每个父行按每个子行各计数一次 | **错误** |
+| `COUNT(parent.col)`（非空） | 同样的放大 | **错误** |
+| `COUNT(*)` | 计数的是连接后的行，不是父行 | **错误** |
+| `AVG(parent.col)` | 分子分母都被放大；对于**均匀**扇出，均值不变；但对于**非均匀**扇出（不同父行的子行数不同），它会静默变成按子行数加权（child-weighted）的均值，而不是父行等权的均值 | **静默偏差 —— 视作错误** |
+| 对 `parent.col` 做 `STDDEV` / `VAR` / `PERCENTILE` | 分布按子行数重新加权 | **错误** |
+| `MAX(parent.col)` / `MIN(parent.col)` | 在行重复下是幂等的 —— 值不变 | **安全** |
+| `COUNT(DISTINCT parent.pk)` | DISTINCT 折叠重复 | **安全** |
+
+检测信号 —— 无论领域或表名如何均适用：
+
+1. SELECT/HAVING 聚合了 1:N 关系中"1"侧的某列，而 FROM 子句又通过 JOIN 触及该关系。
+2. 两级链：`JOIN A → B → C`，指标在 A 上，而 B 是 A 的明细 —— 扇出会经由每一个中间明细表成倍放大，所以每个 A.row 都被归因到它传递触及的每个 C 分组上。
+3. 同一查询既产生头部聚合（如 `SUM(parent.amount)`）又读取明细列（如 `child.sku`、`child.qty`）—— JOIN 满足了明细侧的需求却破坏了聚合。
+
+必做的修复路径 —— 选一条与你的意图匹配的：
+
+- **(a) 去掉子表 JOIN**，如果你不需要它的任何列。这是 KPI 式聚合的正确修复方式，它们应该只针对头部表运行。
+- **(b) 在 CTE 中预先聚合子表**，使 CTE 之后的 JOIN 成为 1:1。当你确实需要按父行的子数据汇总时适用。
+- **(c) `SUM(DISTINCT parent.col)`** 很少正确 —— 仅当 `parent.pk` 在 SELECT/GROUP BY 中且 SUM 目标在父行内唯一时才有效。不要把它当捷径。
+
+对基数不确定时，保存前先用 `execute_sql` 验证：
+
+```sql
+-- 对比这两条 —— 如果 joined_rows >> parent_rows，则每个头部聚合都以该比例出错
+SELECT COUNT(*) FROM <parent_table>   /* 使用最终查询所用的相同 WHERE */;
+SELECT COUNT(*) FROM <parent_table> JOIN <child_table> ON <fk> /* 相同的 WHERE */;
+```
+
+扇出是**必须修复的 bug**，不是要披露的注意事项。不要保存带该 bug 的查询然后再在 `caveats` 里声明 —— caveats 字段用于读者需要知道的合理语义选择（LEFT JOIN 保留无子行的父行、NULL 处理、时间窗口假设等），而不是已知的错误算术。
+
+### 单位约定 —— 探测；不要猜；有歧义就询问
+
+模式几乎从不为数值列标注**单位**。同一个 `revenue` 列可能存美元、美分、基点或千元；`latency` 可能是 ms 或 s；`rate` 可能是 0.05 或 5.0。猜错会静默地把 10× / 100× / 1000× 的误差传播到每一个下游 KPI 和图表，而且没有校验器能发现，因为 SQL 在语法上完美无缺。
+
+**强制探测**任何货币 / 比率 / 时长 / 计数列 —— 只要其名称**没有**显式声明单位（无 `_cents` / `_usd` / `_pct` / `_bps` / `_ms` 后缀、无模式注释、无外围的语义模型定义）：在对其编写任何聚合之前，先运行 `execute_sql` 检查值域。
+
+```sql
+SELECT MIN(<col>) AS lo, MAX(<col>) AS hi, AVG(<col>) AS mid FROM <table>;
+-- 可选：抽样几行获取完整上下文：
+SELECT <col> FROM <table> ORDER BY RANDOM() LIMIT 10;
+```
+
+把结果与领域内的**业务合理性**交叉核对：
+- 三明治店的 AOV 为 `1250`，几乎可以肯定是以美分存储的。AOV 为 `12.50` 则可能是以美元存储的。
+- `latency` 中位数为 `420`，几乎肯定是毫秒。`0.42` 则可能是秒。
+- `tax_rate` 为 `0.06` 是小数。`6.0` 是整数形式的百分数。`600` 是基点。
+
+当探测范围能区分单位时，确定该解释，并**内联说明** —— 在转换 / 算术附近写一条 SQL 注释（`-- order_total is cents; divide by 100 for USD`），这样读者不必重新推导你的推理。
+
+当探测范围**不能**区分时（例如所有值都是 100 到 10000 之间的整数 —— 可能是美分-美元，也可能是美元-千元），不要静默选择你的训练数据最熟悉的约定。已经观察到两个 LLM 在同一个提示词 + 同一份数据集上选择了相反的单位（一个美分、一个美元），产出的仪表盘总计相差 100×。这正是 `ask_user` 工具存在的意义所在 —— 把歧义摆到人类面前，即使提示词的一般性指导倾向是"能推断就别问"。
+
+### 视觉设计
+
+把每个输出当作打磨过的交付物 —— 仪表盘是小型**品牌化分析产品**，报告是**研究风格文档**。质量标准：
+
+- **统一的调色板**放在共享模块顶部（`render/shared/colors.js` 或 `app.jsx` 内联），作为 `COLORS` 常量（primary、secondary、accent、navy/heading、background、text、muted、positive、negative）。选择符合领域的调色板。
+- **用专用常量把分类维度映射到一致的颜色**（`REGION_COLORS`、`SEGMENT_COLORS`、`STATUS_COLORS`、…）。同一个分类在每张图表中都复用同一种颜色。
+- **布局与外壳只用内联样式** —— 布局不用 Tailwind 工具类，不用外部样式表。所有视觉元素都用 `style={{ ... }}` 对象。
+- **卡片原语**来自 `@datus/web-artifact` 的 `<ChartCard>` —— 与每个仪表盘相同的表面（白色背景、12px 圆角、不对称内边距 `padding: '20px 20px 16px'`、细微阴影、flex-column 拉伸 + border-box 尺寸）。每个图表面板都用它包裹。ChartCard 已经布局了标题条 + 图表操作菜单，并暴露 `style` / `className` 供少数需要微调尺寸的场景使用。
+- **响应式网格**：`display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gridAutoRows: '1fr', gap: 16`。`gridAutoRows: '1fr'` 是强制的：没有它，每行高度跟随每张卡片自身的内容，一行里混有带 `<Legend>`（或带额外页脚 / 分页行）的图表与不带它们的图表时，底部会明显错位。配合 flex-column 的 ChartCard 原语，一行中的每张卡片都会拉伸到最高卡片的高度，底部在整行中齐平。
+- **排版**：22px/700 的 H1、14px/600 的卡片标题、24px/700 的 KPI 数字、11–13px 的次要文本。
+- **KPI 迷你走势图**（仪表盘模式）：小的 `<Sparkline>` 组件，使用带垂直渐变填充（5%–95% 透明度节点）和 2px 主色描边的 `AreaChart`。
+- **对比徽章**（仪表盘模式）：KPI 旁边的药丸形 `▲ 12%` / `▼ 8%` 芯片，使用 positive/negative 语义色。
+- **鼓励自定义 SVG 可视化**，当 Recharts 无法表达该想法时：树图、弦图、半圆仪表、评分滑块等。用手写 `<svg>` 路径 + `useMemo` 做布局计算实现。
+- **报告正文排版**（报告模式）：正文 15px / 1.6 行高，`maxWidth: 720`，阅读舒适。H2 为 18px/600 并带主色的细下边框；H3 为 14px/600 并加顶部间距。
+- **章节原语**（报告模式）：`<Section>` 包装，可选眉题（kicker）、标题和正文插槽。章节之间插入细微的分隔线。
+- **提示 / 引文原语**（报告模式）：`<Callout>` 区块，左侧 4px `COLORS.primary`（或 `accent` / `negative`）边框，浅色背景。每节至多一个。
+- **图表题注**（报告模式）：每张图表在 `<ResponsiveContainer>` 下方都有题注，形式为 `图 N. <单行描述>. 来源：<sqlId>，执行于 <date>`。题注为 11px 斜体弱化文本。
+- **数据表格**：斑马条纹行、数字列右对齐、字符串列左对齐、表格卡片内表头吸顶。当数据集**超过 15 行时**按每页 15 行**分页**。表格下方渲染一个小的分页页脚 —— `‹ 上一页`、`<当前> / <总数>` 指示器、`下一页 ›`，排成一行并**在卡片内右对齐**（`display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8`）。绝不要把页脚居中或拉满到边到边 —— flex-end 是强制的，这样同一页面上的多个表格在视觉上对齐。把当前页放在组件本地的 `useState` 中；在第 1 页 / 最后一页禁用边界按钮。不要用"显示更多"开关，也不要一次渲染所有行；分页对用户是更清晰的阅读方式，也让渲染的 DOM 保持小巧。
+
+### 加载与错误占位 —— `Skeleton` / `ErrorBlock`
+
+`Skeleton` 和 `ErrorBlock` 是运行时提供的原语 —— **直接从 `@datus/web-artifact` 导入它们**。不要重新实现；每个产物共享同一个规范外观，并在运行时发布新版本时免费获得升级，与 `ChartCard` 和 `AnimateOnVisible` 完全一样。
+
+```jsx
+import { useDatusArtifact, Skeleton, ErrorBlock } from '@datus/web-artifact';
+
+function RevenueCard({ params }) {
+  const { useQuerySql } = useDatusArtifact();
+  const { isLoading, errorMessage, data, refetch } = useQuerySql('queries/foo', params);
+  if (isLoading) return <Skeleton minHeight={300} />;
+  if (errorMessage) return <ErrorBlock msg={errorMessage} onRetry={refetch} />;
+  // ... 图表 JSX
+}
+```
+
+Props：
+
+| 组件 | Prop | 默认 | 说明 |
+|---|---|---|---|
+| `Skeleton` | `minHeight` | `200` | 匹配图表的预期高度，这样真实内容挂载时布局不会跳动。 |
+| `Skeleton` | `bars` | `3` | 微光条数量（60% / 80% / 40% 宽度循环）。更高的卡片调到 4–5。 |
+| `ErrorBlock` | `msg` | —（必需） | `useQuerySql` 的 `errorMessage` 字段。 |
+| `ErrorBlock` | `onRetry` | `window.location.reload` | 传 `useQuerySql` 的 `refetch`，让"重试"按钮只重跑失败的查询，而不是重载整个 iframe。 |
+| `ErrorBlock` | `minHeight` | `140` | 仅当周围布局要求特定高度时才覆盖。 |
+
+规则：
+
+- **在使用 `useQuerySql` 的组件中始终接上 `onRetry={refetch}`**。回退方案（`window.location.reload()`）会重新挂载整个产物 iframe 并丢失任何本地 UI 状态（过滤器、页码、滚动位置）—— 作为最后手段可以，但不是首选路径。
+- **占位使用固定的中性调色板**（`Skeleton` 用 gray-100/200 微光；`ErrorBlock` 用 red-50 / red-200 / red-700），这样所有产物的错误体验一致。不要试图通过包装 div 覆盖它们的颜色 —— 如果未来需要调色板旋钮，它会作为显式 prop 落地。
+- **运行时占位内部的 Lucide 图标**（`AlertCircle`、`RotateCcw`）是组件的一部分，不是你要导入的东西 —— 它们是下方"图标要克制"规则的例外，因为这些占位是功能性 UI。
+
+### Iconography 与 emoji
+
+- **产物中任何地方都不使用 emoji。** 标题、KPI 名称、关键发现要点、提示框、题注、章节眉题中都不用。Emoji 在不同平台上渲染不一致、无法匹配调色板，还会削弱 BI 交付物所需的分析可信度。
+- **Lucide 图标要克制使用。** 只在三个地方：
+  1. **KPI 卡片** —— 标题左侧一个图标，`16×16`、`strokeWidth={2}`、颜色 `COLORS.muted`。
+  2. **章节标题**（报告模式）—— H2 左侧一个图标，`18×18`、`strokeWidth={2}`、颜色 `COLORS.primary`。可选。
+  3. **趋势 / 状态药丸** —— 增量旁边内联，`12–14px`，颜色绑定语义状态（`COLORS.positive` / `negative` / `warning`）。
+- **绝不把图标**用作项目符号、用在正文散文里、尺寸超过 24px（英雄 KPI 最大 28px），或每张卡片超过一个。如果一张卡片需要两个图标，说明这张卡片承载过多了。
+- **Lucide 样式默认**：`strokeWidth={2}`（更细的在高分屏上发虚）、颜色通过内联 `style={{ color }}`、无阴影 / 无旋转 / 无 `fill`（Lucide 基于描边；填充会变成一团）。
+- **Emoji → Lucide 替换表** —— 当你下意识想用 emoji 时，改用对应的 Lucide 名称：
+
+  | 想用的 Emoji | 对应的 Lucide 名称 |
+  |---|---|
+  | 📈 / 📉 | `TrendingUp` / `TrendingDown` |
+  | 📊 | `BarChart3` / `LineChart` |
+  | 💰 / 💵 | `Banknote` / `DollarSign` / `Wallet` |
+  | 🌍 / 🌐 | `Globe` / `MapPin` |
+  | 🏦 / 🏢 | `Landmark` / `Building2` |
+  | 📱 | `Smartphone` |
+  | 👥 / 🧑 | `Users` / `User` |
+  | ⚡ | `Zap` |
+  | ⚠️ | `TriangleAlert` |
+  | ✅ / ❌ / ℹ️ | `CircleCheck` / `CircleX` / `Info` |
+  | 🔍 / 📅 / 🎯 / 🔔 / ⏰ | `Search` / `Calendar` / `Target` / `Bell` / `Clock` |
+
+  拿不准时，宁可不放图标，也不用错的图标。
+
+### 动效与动画
+
+当读者首次将图表滚动进视野时，图表带动效进入 —— 一个在屏幕外就已经播完动画的图表，感觉和冻结的一样死气沉沉。保留 Recharts 内置的入场动画；通过共享的 `AnimateOnVisible` 包装把挂载推迟到首次进入视口时。
+
+- **不要禁用 Recharts 默认行为。** 永远不要给 `<Bar>` / `<Line>` / `<Area>` / `<Pie>` / `<Radar>` / `<Scatter>` 传 `isAnimationActive={false}`。如果不想要动效，就不要这个图表。
+- **通过三个 props 调校**每个带动画的原语：`animationDuration`（默认 `1500`ms —— KPI 迷你走势图用 `800–1200`，主打图表用 `1500–2000`）、`animationEasing`（入场优先 `'ease-out'`）、`animationBegin`（默认 `0` —— 用 `index * 80–250` ms 错开相关序列，让眼睛能分别读出每一个）。
+- **把挂载推迟到进入视口时。** 用 `@datus/web-artifact` 的 `AnimateOnVisible` 包裹每个带动画的可视化 —— 它有正确的 `IntersectionObserver` 默认值（`rootMargin: '0px 0px -10% 0px'`、`threshold: 0.1`）、首次命中后断开连接，并通过 `minHeight` 预留垂直空间，这样挂载时布局不会跳动。**不要**自己写 `useInView` hook。
+
+```jsx
+import { useDatusArtifact, ChartCard, AnimateOnVisible } from '@datus/web-artifact';
+import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip } from 'recharts';
+
+function RevenueTrend() {
+  const { useQuerySql } = useDatusArtifact();
+  const { data } = useQuerySql('queries/revenue_by_month');
+  const rows = data?.rows ?? [];
+
+  return (
+    <ChartCard
+      cardId="revenue_by_month"
+      sqlId="queries/revenue_by_month"
+      chartType="line"
+      title="营收趋势"
+      data={data}
+    >
+      <AnimateOnVisible minHeight={300}>
+        <ResponsiveContainer width="100%" height={300}>
+          <LineChart data={rows}>
+            <XAxis dataKey="month" />
+            <YAxis />
+            <Tooltip />
+            <Line type="monotone" dataKey="revenue" stroke="#6051F5" />
+          </LineChart>
+        </ResponsiveContainer>
+      </AnimateOnVisible>
+    </ChartCard>
+  );
+}
+```
+
+`AnimateOnVisible` props（全部可选）：
+
+| Prop | 默认 | 何时覆盖 |
+|---|---|---|
+| `minHeight` | `320` | 设为图表的 `<ResponsiveContainer height>`。值错误会在图表挂载时引起布局跳动。 |
+| `immediate` | `false` | 对首屏上方、希望不等观察器就直接播放动画的图表设为 `true`，或作为 `prefers-reduced-motion` 逃生通道。 |
+
+规则：
+- **每个图表面板一个 `AnimateOnVisible`**，而不是整个产物包一个。
+- **预留 `minHeight`** 等于图表的 `<ResponsiveContainer height>` —— 否则图表挂载时页面会跳动。
+- **自定义内联 SVG**（树图、仪表）：也包进 `AnimateOnVisible`；内部通过挂载 `useState` + `useEffect(() => setMounted(true), [])` 切换 CSS 过渡来动画化 `transform` / `opacity` / `stroke-dashoffset`。
+- **尊重减少动态效果（reduced motion）偏好。** 在 `app.jsx` 中计算一次 `window.matchMedia('(prefers-reduced-motion: reduce)').matches`，并给 Recharts 原语传 `animationDuration={prefersReducedMotion ? 0 : 1500}`。`AnimateOnVisible` 保持启用 —— 它只推迟挂载，从不增加动效。
+
+### 图表操作菜单
+
+ChartCard 内嵌图表操作菜单（查看 SQL / 导出 SQL / CSV / JSON / PNG / 复制 PNG）—— 你不需要自己导入或接上 `ChartEntryMore`。ChartCard 直接从其 props 读取 `sqlId` + `data` 并自持截图根节点，因此 PNG 导出会连同标题和图表一起截取，无需你这边任何 `cardRef` 管线。
+
+**每张卡片一个 ChartCard。** 当一张卡片可视化多个子视图（例如共享一个查询的两个并排饼图）时，把它们包进单个 `<ChartCard>`，其主体是一个 2 列网格 —— 而不是两个相邻的 ChartCard。
+
+**把 ChartCard 挂到每个 `useQuerySql` 支撑的可视化上** —— 图表、自定义 SVG，**以及数据表格**（表格放进 ChartCard 主体内，包括头部条；图表操作菜单位于其上方的 ChartCard 标题条中）。例外是 KPI 条：N 个磁贴共享一个查询，逐磁贴的卡片头部会毁掉这一行 —— 那些用 `<BlockHandle>` 而不是 `<ChartCard>`（见"非图表区块的区块手柄"）。
+
+如果你确实需要渲染没有图表操作菜单的卡片（装饰性横幅、一个仍值得拥有卡片外壳的英雄数字），在 ChartCard 上设置 `hideMenu`。
+
+**独立的 `<ChartEntryMore>`** 用于那些承载查询但没有 ChartCard 的区块 —— 两个反复出现的情况是 KPI 条（整条一个菜单，因为所有磁贴共享一个查询）和查询驱动的洞察面板。传 `sqlId` + `data`，并用 `data-datus-chart-card` 标记应被截图的容器。永远不要在 `<ChartCard>` 内部接它 —— 那张卡片已经内嵌了一个。
+
+### 格式化辅助函数
+
+把格式化器集中到共享模块（如 `render/shared/formatters.js`），需要时导入：
+
+```js
+import { format as d3Format } from 'd3-format';
+import dayjs from 'dayjs';
+
+export const N = (v) => (v != null ? Number(v) : 0);
+export const pctChange = (cur, prior) => (prior === 0 ? 0 : (cur - prior) / prior);
+
+const _money = d3Format('$,.3~s');
+const _count = d3Format(',.3~s');
+const _int   = d3Format(',.0f');
+const _pct   = d3Format('+.1%');
+
+export const formatCurrency = (v) => _money(N(v)).replace('k', 'K');
+export const formatNumber   = (v) => _count(N(v)).replace('k', 'K');
+export const formatInt      = (v) => _int(N(v));
+export const formatPct      = (v) => _pct(N(v));
+
+export const formatMonth = (v) => dayjs(v).format('MMM YYYY');
+export const formatDate  = (v) => dayjs(v).format('MMM D, YYYY');
+```
+
+准则：
+- 在算术之前始终用 `N(...)` 强制转换数值单元格 —— BIGINT 会作为 JS `BigInt` 落地，破坏 `Math.*` / `d3-format` / Recharts。
+- 在模块作用域构建 `d3Format(spec)` 说明符（否则每次调用都会重新解析）。
+- 根据列的语义类型选择说明符：`integer` → `_int`，`number` → `_count` 或 `_money`，以小数为存储形式的比率 → `_pct`。
+
+### 沙箱约束
+
+查看器 iframe 只以 `sandbox="allow-scripts"` 运行 —— 空源（null origin），没有 `allow-same-origin`。这意味着：
+- 不能访问 `window.parent`。没有 `localStorage` / `sessionStorage`。
+- 没有 `fetch` —— 数据只来自 `useQuerySql`。
+- 你的代码中不能有 `eval` / `new Function`。
+- 没有路由 —— 渲染出的页面是单一视图。
+
+一切交互都坚持用 React 状态。
+{% endraw %}

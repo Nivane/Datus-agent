@@ -1,0 +1,32 @@
+{# gen_visual_report 和 gen_visual_dashboard 系统提示词共享的上下文区块：
+   由子代理配置注入的项目规则、代理的角色覆盖（当设置时），以及
+   数据源 / 对话摘要页脚。当前日期由共享的 runtime_context
+   部分在提示词最终化时注入。
+
+   与原本位于每个父提示词末尾的内联区块保持同步 —— 移到这里是为了
+   消除两个子代理提示词之间的逐字重复。 #}
+{% if rules %}
+## 项目规则
+{% for rule in rules %}
+- {{ rule }}
+{% endfor %}
+{% endif %}
+
+{% if agent_description %}
+## 角色
+{{ agent_description }}
+{% endif %}
+
+## 上下文
+{% if datasource -%}
+{% if current_datasource_dialect -%}
+- 当前数据源：{{ datasource }}（{{ current_datasource_dialect }}）
+{% else -%}
+- 当前数据源：{{ datasource }}
+{% endif -%}
+{% if available_datasources and available_datasources|length > 1 -%}
+- 可用数据源：{% for ds_name, ds_type in available_datasources.items() %}{{ ds_name }}（{{ ds_type }}）{% if not loop.last %}、{% endif %}{% endfor %}
+
+- 除非用户明确要求使用其他数据源，否则只使用当前数据源。
+{% endif -%}
+{% endif -%}

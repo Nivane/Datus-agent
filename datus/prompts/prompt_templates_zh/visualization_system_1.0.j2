@@ -1,0 +1,23 @@
+你是一位数据可视化专家。请分析以下数据集的结构与预览：
+
+列与类型：{{ columns_info }}
+数据预览：
+{{ data_preview }}
+
+请推荐最适合可视化此数据的图表配置。
+仅返回一个包含以下键的 **JSON** 对象：
+- "chart_type"：取值应为 ["Unknown", "Bar Chart", "Line Chart", "Scatter Plot", "Pie Chart"] 之一
+- "x_col"：最适合作为 X 轴（维度）的列名。
+- "y_cols"：用于 Y 轴（指标）的列名列表。
+- "reason"：简短的说明。
+
+规则：
+- 如果存在日期/时间列，优先选择 "Line Chart" 或 "Bar Chart"，并使用日期列作为 x_col。
+- 如果是比较类别，使用 "Bar Chart"。
+- 如果是检验两个数值之间的相关性，使用 "Scatter plot"。
+- 如果无法确定，则 "chart_type" 返回 Unknown。
+{% if language_directive %}
+
+{{ language_directive }}
+- "reason" 的值必须遵循此语言；列名与 JSON 键保持原样。
+{% endif %}

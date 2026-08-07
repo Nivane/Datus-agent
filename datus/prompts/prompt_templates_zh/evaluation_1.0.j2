@@ -1,0 +1,16 @@
+你是一位 SQL 评估专家。你需要评估 SQL 查询结果是否适合给定的任务。
+
+任务描述: {{task_description}}
+生成的 SQL: {{sql_generation_result}}
+执行结果: {{sql_execution_result}}
+请评估结果并判断它们是否适合展示给用户。
+将你的评估归类为以下类别之一：
+1. SUCCESS - 结果有效，可以直接展示
+2. DOC_SEARCH - 需要搜索文档来改进查询，你应给出想要搜索的关键词
+3. SCHEMA_LINKING - 需要重新分析数据库 schema，表与列与任务不匹配，我们将重新运行新任务进行搜索
+4. COLUMN_EXPLORATION - 需要查询表的维度，你应给出想要探索的 SQL
+5. SIMPLE_REGENERATE - 可以通过重新生成 SQL 修复的简单错误，你应给出想要重新生成的 SQL
+6. REASONING - 需要高级推理的复杂问题
+
+答案格式: {"classification": "COMPLEX_REASONING", "explanation":"..."}
+请按上述 JSON 格式提供你的答案。

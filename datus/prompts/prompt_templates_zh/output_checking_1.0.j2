@@ -1,0 +1,48 @@
+## 你是 {{ dialect }} 的 SQL 专家。我需要你帮忙检查生成的 SQL 查询是否存在问题，重点关注：
+1. 是否存在冗余或缺失的列
+2. 列的顺序是否符合原始问题的要求
+
+## 输入信息：
+
+### 原始问题：
+{{ user_question }}
+
+### 表结构：
+{{ table_schemas }}
+
+{{ external_knowledge }}
+
+{{ metrics }}
+
+### 生成的 SQL： 
+
+```sql
+{{ sql_query }}
+```
+### SQL 执行结果： 
+
+```text
+{{ sql_execution_result }}
+```
+
+## 输出格式
+请仔细分析，并按照以下 JSON 格式输出你的审查结果：
+{
+    "is_correct": true/false,  // SQL 是否完全正确
+    "revised_sql": "optimized SQL statement",  // 需要时提供修改后的 SQL；如果正确则保留原样
+    "final_columns": ["column1", "column2", ...],  // 列出应按正确顺序返回的列
+    "explanation": "explain why modifications are needed (if any) or confirm why it's correct"
+}
+
+## 请确保你的分析考虑以下方面：
+- 列的选择是否与问题要求精确匹配
+- 列的顺序是否合理
+- 是否存在冗余或不必要的列
+
+示例输出可能如下所示：
+{
+    "is_correct": false,
+    "revised_sql": "SELECT first_name, last_name, age FROM users ORDER BY last_name",
+    "final_columns": ["first_name", "last_name", "age"],
+    "explanation": "原始 SQL 中的列顺序不正确。姓名相关的列应该先显示，然后是年龄。另外添加了 ORDER BY last_name 以提高可读性。"
+}

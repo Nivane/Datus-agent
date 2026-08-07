@@ -1,0 +1,48 @@
+你是一位数据可视化与分析专家。请分析以下数据集及其查询上下文，然后给出全面的可视化建议。
+
+## 数据集结构
+列与类型：{{ columns_info }}
+
+## 数据预览
+{{ data_preview }}
+
+{% if sql %}
+## SQL 查询
+```sql
+{{ sql }}
+```
+{% endif %}
+
+{% if user_question %}
+## 用户问题
+{{ user_question }}
+{% endif %}
+
+基于以上所有信息，仅返回一个包含以下键的 **JSON** 对象：
+
+### 图表配置（必填）
+- "chart_type"：取值应为 ["Unknown", "Bar Chart", "Line Chart", "Scatter Plot", "Pie Chart"] 之一
+- "x_col"：最适合作为 X 轴（维度）的列名。
+- "y_cols"：用于 Y 轴（指标）的列名列表。
+- "reason"：关于图表推荐方案的简短说明。
+
+### 数据上下文（提供 SQL 或用户问题时必填）
+- "period"：从 WHERE 条件中提取的时间范围，格式为 "YYYY-MM-DD ~ YYYY-MM-DD"，或可读的时间段（如 "Q4 2025"）。如果不存在时间条件或未提供 SQL，则返回 null。
+- "filters"：从 WHERE 条件中提取的可读筛选条件描述列表（不含时间范围条件）。请用自然语言描述筛选条件，例如用 "Battle Pass 购买" 代替 "purchasesource = BATTLEPASS_PROGRESS"。如果没有筛选条件或未提供 SQL，则返回空列表。
+- "insight"：对数据的简明分析总结（2-4 句话）。突出关键发现、对比、异常或趋势。重点说明数据揭示了什么，而不是查询是如何执行的。
+
+### 规则
+- 如果存在日期/时间列，优先选择 "Line Chart" 或 "Bar Chart"，并使用日期列作为 x_col。
+- 如果是比较类别，使用 "Bar Chart"。
+- 如果是检验两个数值之间的相关性，使用 "Scatter Plot"。
+- 如果无法确定，则 "chart_type" 返回 "Unknown"。
+- 对于 "filters"，将技术性的 SQL 条件转换为用户友好的描述。
+- 对于 "insight"，要分析实际的数据值，而不仅仅是描述查询结构。
+- 如果既未提供 SQL 也未提供用户问题，则在响应中省略 "period"、"filters" 和 "insight"。
+{% if language_directive %}
+
+{{ language_directive }}
+- "reason"、"filters" 和 "insight" 的值必须遵循此语言；列名、SQL 与 JSON 键保持原样。
+{% else %}
+- 请使用与用户问题相同的语言书写 "reason"、"filters" 和 "insight"；未提供问题时回退为英语。
+{% endif %}
