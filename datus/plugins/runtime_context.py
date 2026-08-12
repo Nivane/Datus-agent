@@ -11,9 +11,9 @@ minimum invocation-specific configuration across that process boundary without
 requiring an on-disk ``agent.yml``.
 
 The context is intentionally passed through one command-scoped environment
-variable.  It contains only the invoked plugin's resolved profile and, when
-needed, the exact plugin directory selected by the normal managed-store /
-``agent.plugin_paths`` precedence.
+variable.  It contains only the invoked plugin's resolved profile, any
+manifest-declared one-hop delegate profiles, and the exact plugin directories
+selected by the normal managed-store / ``agent.plugin_paths`` precedence.
 
 The Bash command itself is preserved verbatim: :func:`prepare_plugin_invocation`
 locates the single ``datus`` command word and inserts an inline environment
@@ -39,6 +39,10 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from datus.utils.loggings import get_logger
+
+logger = get_logger(__name__)
 
 RUNTIME_CONTEXT_ENV = "DATUS_PLUGIN_RUNTIME_CONTEXT"
 RUNTIME_CONTEXT_VERSION = 1
@@ -70,12 +74,21 @@ class PluginRuntimeContextError(ValueError):
 
 
 @dataclass(frozen=True)
+class PluginRuntimeTarget:
+    """One pre-authorized plugin profile available to a composed invocation."""
+
+    profile: Dict[str, Any]
+    plugin_path: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class PluginRuntimeContext:
     """Configuration consumed by one ``datus <plugin>`` subprocess."""
 
     plugin_name: str
     profile: Dict[str, Any]
     plugin_path: Optional[str] = None
+    delegates: Dict[str, PluginRuntimeTarget] = field(default_factory=dict)
     version: int = RUNTIME_CONTEXT_VERSION
 
     def encode(self) -> str:
@@ -87,6 +100,13 @@ class PluginRuntimeContext:
                     "plugin_name": self.plugin_name,
                     "profile": self.profile,
                     "plugin_path": self.plugin_path,
+                    "delegates": {
+                        name: {
+                            "profile": target.profile,
+                            "plugin_path": target.plugin_path,
+                        }
+                        for name, target in self.delegates.items()
+                    },
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -124,16 +144,49 @@ class PluginRuntimeContext:
         plugin_path = data.get("plugin_path")
         if not isinstance(plugin_name, str) or not plugin_name:
             raise PluginRuntimeContextError("Plugin runtime context has no valid plugin name")
-        if expected_plugin is not None and plugin_name != expected_plugin:
-            raise PluginRuntimeContextError(f"Plugin runtime context is for `{plugin_name}`, not `{expected_plugin}`")
         if not isinstance(profile, dict):
             raise PluginRuntimeContextError("Plugin runtime context profile must be an object")
         if plugin_path is not None and (not isinstance(plugin_path, str) or not plugin_path.strip()):
             raise PluginRuntimeContextError("Plugin runtime context path must be a non-empty string")
-        return cls(
+        raw_delegates = data.get("delegates", {})
+        if not isinstance(raw_delegates, dict):
+            raise PluginRuntimeContextError("Plugin runtime context delegates must be an object")
+        delegates: Dict[str, PluginRuntimeTarget] = {}
+        for delegate_name, raw_target in raw_delegates.items():
+            if not isinstance(delegate_name, str) or not delegate_name or delegate_name == plugin_name:
+                raise PluginRuntimeContextError("Plugin runtime context has an invalid delegate name")
+            if not isinstance(raw_target, dict):
+                raise PluginRuntimeContextError(f"Plugin runtime context delegate `{delegate_name}` must be an object")
+            delegate_profile = raw_target.get("profile")
+            delegate_path = raw_target.get("plugin_path")
+            if not isinstance(delegate_profile, dict):
+                raise PluginRuntimeContextError(
+                    f"Plugin runtime context delegate `{delegate_name}` profile must be an object"
+                )
+            if delegate_path is not None and (not isinstance(delegate_path, str) or not delegate_path.strip()):
+                raise PluginRuntimeContextError(
+                    f"Plugin runtime context delegate `{delegate_name}` path must be a non-empty string"
+                )
+            delegates[delegate_name] = PluginRuntimeTarget(delegate_profile, delegate_path)
+
+        context = cls(
             plugin_name=plugin_name,
             profile=profile,
             plugin_path=plugin_path,
+            delegates=delegates,
+            version=RUNTIME_CONTEXT_VERSION,
+        )
+        if expected_plugin is None or expected_plugin == plugin_name:
+            return context
+        target = delegates.get(expected_plugin)
+        if target is None:
+            raise PluginRuntimeContextError(f"Plugin runtime context is for `{plugin_name}`, not `{expected_plugin}`")
+        # A delegate receives only its own resolved profile/path. It cannot
+        # reuse sibling delegations or extend the chain transitively.
+        return cls(
+            plugin_name=expected_plugin,
+            profile=target.profile,
+            plugin_path=target.plugin_path,
             version=RUNTIME_CONTEXT_VERSION,
         )
 
@@ -201,11 +254,143 @@ def has_plugin_config_global(args: List[str]) -> bool:
 
 
 def load_runtime_context_from_env(*, expected_plugin: Optional[str] = None) -> Optional[PluginRuntimeContext]:
-    """Return the runtime context from this process, or ``None`` when absent."""
+    """Return the runtime context from this process, or ``None`` when absent.
+
+    Selecting a delegate narrows the inherited environment value to that
+    delegate before plugin code runs.  Any subprocess it starts therefore
+    cannot reuse the primary plugin's sibling delegates or extend the chain.
+    """
     value = os.environ.get(RUNTIME_CONTEXT_ENV)
     if value is None:
         return None
-    return PluginRuntimeContext.decode(value, expected_plugin=expected_plugin)
+    context = PluginRuntimeContext.decode(value, expected_plugin=expected_plugin)
+    if expected_plugin is not None:
+        os.environ[RUNTIME_CONTEXT_ENV] = context.encode()
+    return context
+
+
+def _load_manifest_for_invocation(plugin_name: str, plugin_path: Optional[Path]) -> Any:
+    """Read the manifest of the plugin copy this invocation will actually run.
+
+    ``plugin_path`` is the directory the normal store / ``agent.plugin_paths``
+    precedence already selected, so the manifest is read from there. Falling
+    back to the ``sys.path`` entry-point registry would be wrong in the two
+    deployments that matter most: a plugin mounted through
+    ``agent.plugin_paths`` (multi-tenant sandboxes) is not on the host
+    process's ``sys.path`` at all, and a host that never activated the managed
+    store sees a stale, empty registry. Both cases would silently yield "no
+    manifest" and drop every declared delegation.
+
+    ``plugin_path is None`` means the plugin lives in this interpreter's
+    site-packages, where the entry-point registry is the correct source.
+    """
+    from datus.plugins import store
+    from datus.plugins.registry import load_plugin_manifest
+
+    if plugin_path is None:
+        return load_plugin_manifest(plugin_name)
+    return store.manifest_for_dir(plugin_path, plugin_name)
+
+
+def _resolve_profile_delegates(
+    agent_config: Any,
+    plugin_name: str,
+    profile: Dict[str, Any],
+    plugin_path: Optional[Path] = None,
+) -> Dict[str, PluginRuntimeTarget]:
+    """Resolve manifest-declared, one-hop plugin profile references.
+
+    ``x-plugin-profile-ref`` lives on a top-level ``config_schema`` property.
+    The property's value in the current profile names the delegated plugin;
+    ``profile_field`` optionally names the sibling property containing its
+    profile name. ``default_profile: same-name`` falls back to the primary
+    profile's injected ``name``. Only these exact references are copied from
+    the authoritative AuthProvider AgentConfig.
+    """
+    from datus.plugins import store
+
+    manifest = _load_manifest_for_invocation(plugin_name, plugin_path)
+    if manifest is None:
+        # Never silent: without a manifest no delegation can be declared, and
+        # the failure would otherwise only surface as the delegate subprocess
+        # rejecting its runtime context.
+        logger.warning(
+            "Plugin `%s` manifest could not be read from %s; any declared plugin profile "
+            "references are ignored for this invocation.",
+            plugin_name,
+            plugin_path or "the current Python environment",
+        )
+        return {}
+    schema = manifest.config_schema
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict):
+        return {}
+
+    delegates: Dict[str, PluginRuntimeTarget] = {}
+    for plugin_field, property_schema in properties.items():
+        if not isinstance(property_schema, dict):
+            continue
+        reference = property_schema.get("x-plugin-profile-ref")
+        if reference is None:
+            continue
+        if not isinstance(reference, dict):
+            raise PluginRuntimeContextError(
+                f"Plugin `{plugin_name}` config_schema property `{plugin_field}` has an invalid "
+                "x-plugin-profile-ref declaration"
+            )
+
+        raw_delegate_name = profile.get(plugin_field)
+        if raw_delegate_name is None or str(raw_delegate_name).strip() == "":
+            continue
+        delegate_name = str(raw_delegate_name).strip()
+        if not store.is_valid_name(delegate_name) or delegate_name in store.RESERVED_PLUGIN_NAMES:
+            raise PluginRuntimeContextError(
+                f"Plugin `{plugin_name}` profile field `{plugin_field}` names invalid plugin `{delegate_name}`"
+            )
+        if delegate_name == plugin_name:
+            raise PluginRuntimeContextError(f"Plugin `{plugin_name}` cannot delegate its runtime profile to itself")
+        if hasattr(agent_config, "plugin_active") and not agent_config.plugin_active(delegate_name):
+            raise PluginRuntimeContextError(f"Delegated plugin `{delegate_name}` is not active for this project")
+
+        profile_field = reference.get("profile_field")
+        if profile_field is not None and (not isinstance(profile_field, str) or not profile_field.strip()):
+            raise PluginRuntimeContextError(
+                f"Plugin `{plugin_name}` profile reference for `{plugin_field}` has an invalid profile_field"
+            )
+        profile_field = profile_field.strip() if isinstance(profile_field, str) else None
+        default_profile = reference.get("default_profile", "plugin-default")
+        if default_profile not in {"plugin-default", "same-name"}:
+            raise PluginRuntimeContextError(
+                f"Plugin `{plugin_name}` profile reference for `{plugin_field}` has unsupported "
+                f"default_profile {default_profile!r}"
+            )
+
+        delegate_profile_name: Optional[str] = None
+        if profile_field:
+            raw_profile_name = profile.get(profile_field)
+            if raw_profile_name is not None and str(raw_profile_name).strip():
+                delegate_profile_name = str(raw_profile_name).strip()
+        if delegate_profile_name is None and default_profile == "same-name":
+            raw_primary_name = profile.get("name")
+            if raw_primary_name is None or not str(raw_primary_name).strip():
+                raise PluginRuntimeContextError(
+                    f"Plugin `{plugin_name}` profile needs a name to resolve same-name delegate `{delegate_name}`"
+                )
+            delegate_profile_name = str(raw_primary_name).strip()
+
+        delegate_profile = agent_config.get_plugin_profile(delegate_name, delegate_profile_name)
+        delegate_path = _resolve_plugin_path(agent_config, delegate_name)
+        target = PluginRuntimeTarget(
+            profile=dict(delegate_profile),
+            plugin_path=str(delegate_path) if delegate_path is not None else None,
+        )
+        previous = delegates.get(delegate_name)
+        if previous is not None and previous != target:
+            raise PluginRuntimeContextError(
+                f"Plugin `{plugin_name}` resolves conflicting profiles for delegate `{delegate_name}`"
+            )
+        delegates[delegate_name] = target
+    return delegates
 
 
 def prepare_plugin_invocation(command: str, agent_config: Any) -> Optional[PreparedPluginInvocation]:
@@ -286,10 +471,12 @@ def prepare_plugin_invocation(command: str, agent_config: Any) -> Optional[Prepa
 
     plugin_path = _resolve_plugin_path(agent_config, plugin_name)
     profile = agent_config.get_plugin_profile(plugin_name, profile_name)
+    delegates = _resolve_profile_delegates(agent_config, plugin_name, profile, plugin_path)
     runtime = PluginRuntimeContext(
         plugin_name=plugin_name,
         profile=profile,
         plugin_path=str(plugin_path) if plugin_path is not None else None,
+        delegates=delegates,
     )
     encoded = runtime.encode()
 
@@ -308,6 +495,11 @@ def prepare_plugin_invocation(command: str, agent_config: Any) -> Optional[Prepa
         + command[insert_at:]
     )
     read_dirs = [str(plugin_path)] if plugin_path is not None else []
+    read_dirs.extend(
+        target.plugin_path
+        for target in delegates.values()
+        if target.plugin_path is not None and target.plugin_path not in read_dirs
+    )
     return PreparedPluginInvocation(
         command=wrapped_command,
         env={RUNTIME_CONTEXT_ENV: encoded},
@@ -748,6 +940,7 @@ __all__ = [
     "PreparedPluginInvocation",
     "PluginRuntimeContext",
     "PluginRuntimeContextError",
+    "PluginRuntimeTarget",
     "RUNTIME_CONTEXT_ENV",
     "has_plugin_config_global",
     "load_runtime_context_from_env",

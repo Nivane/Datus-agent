@@ -105,24 +105,57 @@ def _assistant_content_fingerprint(event: SSEEvent) -> str:
 def _should_skip_duplicate_assistant_message(
     action,
     event: SSEEvent,
-    seen_fingerprints: set[str],
+    seen_fingerprints: dict[str, str],
 ) -> bool:
+    """Return True when this event repeats text already sent this turn.
+
+    ``seen_fingerprints`` maps rendered text -> the message_id that first
+    carried it, because UPDATE has to be judged differently from CREATE:
+
+    * CREATE re-stating known text is always a duplicate.
+    * UPDATE re-stating it is a duplicate only under a *different* message_id.
+      An UPDATE on the id that already owns the text is the legitimate
+      overwrite path (streamed thinking deltas replaced by the finished
+      response, ``finalize_progress`` stepping one bubble through its stages).
+
+    Judging UPDATE at all is the point: one assistant turn carrying text plus N
+    parallel tool calls opens N ``thinking_stream_*`` messages that each stream
+    the same prose and each close with an UPDATE. Skipping UPDATE entirely —
+    which this did — let all N through, and a mission thread rendered the same
+    paragraph four times in a row.
+    """
     if action.role != ActionRole.ASSISTANT or action.status != ActionStatus.SUCCESS:
         return False
     if action.action_type == "thinking_delta":
         return False
     if event.event != "message" or not isinstance(event.data, SSEMessageData):
         return False
-    if event.data.type != SSEDataType.CREATE_MESSAGE:
+    if event.data.type not in (SSEDataType.CREATE_MESSAGE, SSEDataType.UPDATE_MESSAGE):
         return False
+
     fingerprint = _assistant_content_fingerprint(event)
-    return bool(fingerprint and fingerprint in seen_fingerprints)
+    if not fingerprint:
+        return False
+
+    owner = seen_fingerprints.get(fingerprint)
+    if owner is None:
+        return False
+    if event.data.type == SSEDataType.UPDATE_MESSAGE:
+        return owner != event.data.payload.message_id
+    return True
 
 
-def _remember_assistant_message(event: SSEEvent, seen_fingerprints: set[str]) -> None:
+def _remember_assistant_message(event: SSEEvent, seen_fingerprints: dict[str, str]) -> None:
     fingerprint = _assistant_content_fingerprint(event)
-    if fingerprint:
-        seen_fingerprints.add(fingerprint)
+    if not fingerprint:
+        return
+    # First writer wins — it is the one whose UPDATEs stay legitimate.
+    seen_fingerprints.setdefault(fingerprint, _message_id_of(event))
+
+
+def _message_id_of(event: SSEEvent) -> str:
+    data = event.data
+    return data.payload.message_id if isinstance(data, SSEMessageData) else ""
 
 
 def _should_include_final_response(action, assistant_response_sent: bool) -> bool:
@@ -368,6 +401,11 @@ class ChatTaskManager:
         # the literal "." for the SQL files root because the IDE owns its own
         # workspace path).
         agent_config._client_source = effective_source
+        # Who dispatched this run. Read by ``_setup_task_result_tool`` to decide
+        # whether the agent gets a way to declare a structured outcome. Stashed
+        # on the cloned config, like _client_source, so concurrent requests on
+        # the same project do not see each other's origin.
+        agent_config._request_origin = getattr(request, "origin", None)
         # Per-request response language override. Empty / None keeps the
         # yaml-level ``agent.language`` default intact.
         if request.language:
@@ -697,7 +735,7 @@ class ChatTaskManager:
                 # by a stale assistant_response_sent carried over between passes.
                 assistant_response_sent = False
                 tool_result_seen = False
-                seen_assistant_message_fingerprints: set[str] = set()
+                seen_assistant_message_fingerprints: dict[str, str] = {}
                 async for action in node.execute_stream_with_interactions(action_history):
                     action_count += 1
 
@@ -1081,63 +1119,21 @@ class ChatTaskManager:
         ``/profile`` flow can still mutate the global field because it
         owns the process exclusively; this API path cannot.
 
-        No-ops when ``permission_mode`` is falsy, the node has no
-        ``permission_manager`` (e.g. workflow nodes that skip the skill
-        setup), or the requested profile already matches the active one.
-        Failure handling is split deliberately:
+        Because the override lives on the node, a subagent built later from
+        the same shared config does not see it — ``SubAgentTaskTool`` copies
+        it down explicitly.
 
-        * Building ``user_overrides`` from ``agent.yml`` fails closed —
-          raises so the outer ``_run_loop`` aborts the turn and emits an
-          SSE error. Silently dropping malformed user rules would apply
-          the bare profile base, which can be **broader** than the
-          operator-configured posture (e.g. yaml had an explicit DENY
-          we'd lose), so the safe move is to refuse the switch loudly.
-        * ``switch_profile`` failures (unknown profile, malformed merge
-          result) are logged and swallowed because at that point the
-          node still has its original, server-default profile installed.
+        See :func:`apply_profile_override` for the no-op and failure rules;
+        a raise from there aborts the turn in ``_run_loop`` and emits an SSE
+        error, which is the intended fail-closed behaviour.
         """
-        if not permission_mode:
-            return
-        permission_manager = getattr(node, "permission_manager", None)
-        if permission_manager is None:
-            return
-        if getattr(permission_manager, "active_profile", None) == permission_mode:
-            return
+        from datus.tools.permission.profile_override import apply_profile_override
 
-        from datus.tools.permission.profiles import build_user_overrides
-
-        raw_permissions = getattr(agent_config, "_raw_permissions", {}) or {}
-        raw_user = {k: v for k, v in raw_permissions.items() if k != "profile"}
-        try:
-            user_overrides = build_user_overrides(permission_mode, raw_user)
-        except Exception as exc:
-            logger.error(
-                "Cannot build user overrides for permission_mode=%r from agent.yml: %s; "
-                "refusing to switch profile to avoid broadening permissions beyond the "
-                "operator-configured rules",
-                permission_mode,
-                exc,
-                exc_info=True,
-            )
-            raise RuntimeError(
-                f"Failed to apply permission_mode={permission_mode!r}: agent.yml permissions.rules is malformed ({exc})"
-            ) from exc
-
-        try:
-            permission_manager.switch_profile(permission_mode, user_overrides=user_overrides)
-        except Exception as e:
-            logger.error(
-                "Failed to switch permission profile to %r for session=%s: %s",
-                permission_mode,
-                getattr(node, "session_id", None),
-                e,
-            )
-            return
-
-        logger.info(
-            "Applied per-request permission profile %r for session=%s",
+        apply_profile_override(
+            getattr(node, "permission_manager", None),
+            agent_config,
             permission_mode,
-            getattr(node, "session_id", None),
+            subject=f"session={getattr(node, 'session_id', None)}",
         )
 
     # ------------------------------------------------------------------

@@ -714,6 +714,86 @@ class TestUnifiedReprint:
         # up once, in the user header at the top — which we also emit).
         assert output.count("original question") == 1
 
+    def _completed_chat_turn(self, *, wrapper_response: str) -> list:
+        """A finished chat turn exactly as ``chat_commands`` records it.
+
+        ``all_turn_actions`` stores ``incremental_actions`` (tool calls plus the
+        model layer's plain ``response``) followed by the node's
+        ``chat_response`` wrapper, whose ``output`` is
+        ``ChatNodeResult.model_dump()`` — i.e. a ``response`` key and no
+        ``raw_output``.
+        """
+        return [
+            _make_action(
+                ActionRole.TOOL,
+                ActionStatus.SUCCESS,
+                messages="ok",
+                input_data={"function_name": "list_tables"},
+            ),
+            _make_action(
+                ActionRole.ASSISTANT,
+                ActionStatus.SUCCESS,
+                action_type="response",
+                messages="The orders table has 42 rows.",
+                output_data={"raw_output": "The orders table has 42 rows.", "is_thinking": False},
+            ),
+            _make_action(
+                ActionRole.ASSISTANT,
+                ActionStatus.SUCCESS,
+                action_type="chat_response",
+                messages="chat interaction completed successfully",
+                output_data={"success": True, "response": wrapper_response, "tokens_used": 10},
+            ),
+        ]
+
+    def test_reprint_history_turn_renders_wrapper_response_body(self):
+        """Mid-run Ctrl+O must reprint the previous turn's answer, not the
+        wrapper's boilerplate summary.
+
+        ``render_action_history`` drops both the ``chat_response`` wrapper and
+        the trailing plain ``response``, so the per-turn callback is the only
+        thing painting the answer. Reading the wrapper's ``messages`` there
+        replaced completed answers with "chat interaction completed
+        successfully" after toggling verbose mid-stream.
+        """
+        buf = StringIO()
+        console = Console(file=buf, no_color=True, width=100)
+        display = ActionHistoryDisplay(console)
+
+        ctx = InlineStreamingContext(
+            [],
+            display,
+            history_turns=[("how many rows in orders?", self._completed_chat_turn(wrapper_response="42 rows total."))],
+            current_user_message="now check customers",
+        )
+        ctx._processed_index = 0
+
+        ctx._reprint_history(verbose=False)
+
+        output = buf.getvalue()
+        assert "42 rows total." in output
+        assert "interaction completed successfully" not in output
+
+    def test_reprint_history_turn_falls_back_to_plain_response_body(self):
+        """An empty wrapper body falls through to the plain ``response`` text."""
+        buf = StringIO()
+        console = Console(file=buf, no_color=True, width=100)
+        display = ActionHistoryDisplay(console)
+
+        ctx = InlineStreamingContext(
+            [],
+            display,
+            history_turns=[("how many rows in orders?", self._completed_chat_turn(wrapper_response=""))],
+            current_user_message="now check customers",
+        )
+        ctx._processed_index = 0
+
+        ctx._reprint_history(verbose=True)
+
+        output = buf.getvalue()
+        assert "The orders table has 42 rows." in output
+        assert "interaction completed successfully" not in output
+
     def test_reprint_verbose_mode_with_active_groups(self):
         """Reprint in verbose mode shows active groups with in-progress indicator."""
         buf = StringIO()
@@ -751,6 +831,194 @@ class TestUnifiedReprint:
         output = buf.getvalue()
         assert "in progress" in output
         assert "3 tool uses" in output
+
+
+# ── Ctrl+O toggle while a tool is still running ──────────────────
+
+
+def _pinned_text(live_state) -> str:
+    """Flatten the pinned region into plain text."""
+    return "\n".join("".join(seg for _style, seg in line.segments) for line in live_state.snapshot())
+
+
+@pytest.mark.ci
+class TestVerboseToggleKeepsRunningTool:
+    """A tool that is still executing must survive a Ctrl+O rebuild.
+
+    Its blinking frame lives in the pinned region, and the reprinted history
+    slice deliberately skips PROCESSING rows, so both directions of the toggle
+    need explicit handling — otherwise an in-flight call disappears from the
+    screen until it returns.
+    """
+
+    def _build_ctx(self):
+        """Context with one main-agent tool pinned as running (TUI path)."""
+        from datus.cli.tui.live_display_state import LiveDisplayState
+
+        buf = StringIO()
+        console = Console(file=buf, no_color=True, width=200)
+        live_state = LiveDisplayState()
+        display = ActionHistoryDisplay(console, live_state=live_state)
+
+        running = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            action_type="list_tables",
+            messages="list_tables",
+            input_data={
+                "function_name": "list_tables",
+                "arguments": {"catalog": "main", "schema": "public"},
+            },
+            action_id="call-1",
+            start_time=datetime.now() - timedelta(seconds=3),
+        )
+        ctx = InlineStreamingContext([running], display, current_user_message="show the tables", live_state=live_state)
+        # Mirror the live path: _process_actions pins the frame and steps past
+        # the PROCESSING entry (its SUCCESS twin has not arrived yet).
+        ctx._process_actions()
+        # Screen clearing is the terminal's job; keep the buffer readable.
+        ctx.set_clear_screen_callback(lambda: None)
+        return ctx, buf, live_state, running
+
+    def test_running_tool_starts_pinned_not_in_scrollback(self):
+        """Baseline: the frame is Live-only, which is why the toggle can lose it."""
+        ctx, buf, live_state, running = self._build_ctx()
+
+        assert ctx._processing_action is running
+        assert ctx._processed_index == 1
+        assert "list_tables" not in buf.getvalue()
+        assert "list_tables" in _pinned_text(live_state)
+
+    def test_verbose_snapshot_renders_running_tool_with_args(self):
+        """Ctrl+O → verbose: the frozen snapshot keeps the running call."""
+        ctx, buf, _live_state, _running = self._build_ctx()
+
+        ctx._apply_verbose_toggle()
+
+        output = buf.getvalue()
+        assert ctx._verbose is True
+        assert "list_tables" in output
+        assert "running" in output
+        # Verbose expands every argument — that is what Ctrl+O is for.
+        assert "catalog: main" in output
+        assert "schema: public" in output
+
+    def test_compact_toggle_repins_running_tool(self):
+        """Ctrl+O → verbose → compact: the frame returns to the pinned region."""
+        ctx, _buf, live_state, running = self._build_ctx()
+
+        ctx._apply_verbose_toggle()
+        # The frozen snapshot owns the whole screen — nothing may stay pinned,
+        # but the frame's state has to survive so compact can restore it.
+        assert live_state.line_count() == 0
+        assert ctx._processing_action is running
+
+        ctx._apply_verbose_toggle()
+
+        assert ctx._verbose is False
+        assert ctx._processing_action is running
+        assert "list_tables" in _pinned_text(live_state)
+
+    def test_toggle_without_clear_callbacks_still_rebuilds(self):
+        """No host clear-screen hook: the toggle clears the console itself."""
+        ctx, buf, _live_state, _running = self._build_ctx()
+        ctx.set_clear_screen_callback(None)
+
+        ctx._apply_verbose_toggle()
+
+        assert ctx._verbose is True
+        assert "list_tables" in buf.getvalue()
+
+    def test_toggle_survives_failing_clear_callbacks(self):
+        """A raising clear hook must not take the rebuilt transcript with it.
+
+        A stale screen is recoverable; losing the reprinted history — including
+        the running tool — is not.
+        """
+        ctx, buf, _live_state, _running = self._build_ctx()
+
+        def _boom() -> None:
+            raise RuntimeError("terminal went away")
+
+        ctx.set_clear_screen_callback(_boom)
+        ctx.set_clear_header_callback(_boom)
+
+        ctx._apply_verbose_toggle()
+
+        assert ctx._verbose is True
+        assert "list_tables" in buf.getvalue()
+        assert "running" in buf.getvalue()
+
+    def test_restored_frame_is_released_when_the_tool_completes(self):
+        """The re-pinned frame is not sticky: its SUCCESS twin still clears it."""
+        ctx, buf, live_state, running = self._build_ctx()
+
+        ctx._apply_verbose_toggle()
+        ctx._apply_verbose_toggle()
+        buf.truncate(0)
+        buf.seek(0)
+
+        ctx.actions.append(
+            _make_action(
+                ActionRole.TOOL,
+                ActionStatus.SUCCESS,
+                action_type="list_tables",
+                messages="list_tables",
+                input_data=running.input,
+                output_data={"result": "orders, customers"},
+                action_id="complete_call-1",
+                start_time=running.start_time,
+                end_time=datetime.now(),
+            )
+        )
+        ctx._process_actions()
+
+        assert ctx._processing_action is None
+        assert live_state.line_count() == 0
+        # Completed exactly once in the scrollback — the restored frame must
+        # not have left a second copy behind.
+        assert buf.getvalue().count("list_tables") == 1
+
+    def test_verbose_snapshot_renders_subagent_running_tool(self):
+        """A subagent's own in-flight tool survives the freeze too."""
+        from datus.cli.tui.live_display_state import LiveDisplayState
+
+        buf = StringIO()
+        console = Console(file=buf, no_color=True, width=200)
+        live_state = LiveDisplayState()
+        display = ActionHistoryDisplay(console, live_state=live_state)
+
+        anchor = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=0,
+            action_id="grp-1",
+            action_type="task",
+            messages="task(gen_metrics)",
+            input_data={"type": "gen_metrics", "prompt": "compute base metrics"},
+        )
+        inner_running = _make_action(
+            ActionRole.TOOL,
+            ActionStatus.PROCESSING,
+            depth=1,
+            action_type="profile_table",
+            messages="profile_table",
+            input_data={"function_name": "profile_table", "arguments": {"table": "orders"}},
+            parent_action_id="grp-1",
+        )
+        ctx = InlineStreamingContext(
+            [anchor, inner_running], display, current_user_message="build metrics", live_state=live_state
+        )
+        ctx._process_actions()
+        ctx.set_clear_screen_callback(lambda: None)
+        assert ctx._subagent_groups["grp-1"]["processing_action"] is inner_running
+
+        ctx._apply_verbose_toggle()
+
+        output = buf.getvalue()
+        assert "gen_metrics" in output
+        assert "profile_table" in output
+        assert "in progress" in output
 
 
 # ── INTERACTION handling in streaming ─────────────────────────────

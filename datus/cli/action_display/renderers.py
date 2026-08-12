@@ -48,6 +48,31 @@ def _truncate_middle(text: str, max_len: int = 120) -> str:
     return text[:keep] + " ... " + text[-keep:]
 
 
+def resolve_assistant_body(action: ActionHistory) -> str:
+    """Return the user-facing body carried by an ASSISTANT action's ``output``.
+
+    ``raw_output`` is what the model layer writes for streamed assistant text;
+    ``response`` is what node result models (e.g. ``ChatNodeResult.response``)
+    carry on the terminal ``<node>_response`` wrapper action — that wrapper's own
+    ``messages`` is only a boilerplate summary ("chat interaction completed
+    successfully"). Returns ``""`` when no body is present, so callers rendering
+    a wrapper can tell "no body" apart from that boilerplate — unlike
+    :func:`_get_assistant_content`, which falls back to ``messages``.
+    """
+    from datus.utils.text_utils import strip_litellm_placeholder
+
+    if not isinstance(action.output, dict):
+        return ""
+    for key in ("raw_output", "response"):
+        value = action.output.get(key)
+        if not isinstance(value, str):
+            continue
+        body = strip_litellm_placeholder(value)
+        if body.strip():
+            return body
+    return ""
+
+
 def _get_assistant_content(action: ActionHistory) -> str:
     """Extract display content from an ASSISTANT action, preferring output.raw_output."""
     from datus.utils.text_utils import strip_litellm_placeholder
@@ -971,6 +996,26 @@ class ActionRenderer:
         if action.depth > 0:
             return Text.from_markup(f"[dim]  \u23bf  {body}[/dim]")
         return Text.from_markup(body)
+
+    def render_running_tool(self, action: ActionHistory, frame: str, verbose: bool) -> List[RenderableType]:
+        """Render a still-running tool as permanent (non-Live) output.
+
+        The blinking frame lives in the pinned region, which is torn down
+        whenever the screen is rebuilt (Ctrl+O verbose snapshot). Re-emitting
+        the running tool here keeps an in-flight call visible instead of
+        letting it vanish from the transcript until it completes.
+
+        Verbose mode appends the same argument block
+        :meth:`_render_main_tool` prints for a completed call; the output
+        block is necessarily absent because the tool has not returned yet.
+        """
+        from datus.cli.action_display.tool_content import extract_args_markup
+
+        result: List[RenderableType] = [self.render_processing(action, frame)]
+        if verbose:
+            result.extend(Text.from_markup(f"    {line}") for line in extract_args_markup(action))
+        result.append(Text(""))
+        return result
 
     # -- utility renderables ------------------------------------------------
 
