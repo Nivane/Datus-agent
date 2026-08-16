@@ -23,6 +23,7 @@ from datus.cli.action_display.renderers import (
     is_task_anchor_input,
     parse_task_tool_input,
     render_assistant_response_markdown,
+    resolve_assistant_body,
 )
 from datus.schemas.action_history import (
     INTERRUPTED_ACTION_TYPE,
@@ -584,77 +585,7 @@ class InlineStreamingContext:
             # Check for verbose toggle request (Ctrl+O)
             if self._verbose_toggle_event.is_set():
                 self._verbose_toggle_event.clear()
-                self._verbose = not self._verbose
-
-                if self._verbose:
-                    # Entering verbose mode: freeze — show snapshot, stop all Live displays
-                    self._verbose_frozen = True
-                    self._stop_processing_live()
-                    self._stop_subagent_live()
-                    with self._print_lock:
-                        if self._clear_screen_callback is not None:
-                            try:
-                                self._clear_screen_callback()
-                            except Exception as exc:
-                                logger.debug(
-                                    "clear_screen_callback raised in verbose toggle: %s",
-                                    exc,
-                                    exc_info=True,
-                                )
-                        else:
-                            self.display.console.clear()
-                            sys.stdout.write("\033[3J")
-                            sys.stdout.flush()
-                        if self._clear_header_callback is not None:
-                            try:
-                                self._clear_header_callback()
-                            except Exception as exc:
-                                logger.debug(
-                                    "clear_header_callback raised in verbose toggle: %s",
-                                    exc,
-                                    exc_info=True,
-                                )
-                        self.display.console.print(
-                            "[bold bright_black]  \u23af switched to verbose mode (frozen) \u23af[/]"
-                        )
-                    self._reprint_history(verbose=True, show_active_groups=True)
-                    # Do NOT restart any Live displays — screen is frozen
-                else:
-                    # Returning to compact mode: unfreeze — resume real-time processing
-                    self._verbose_frozen = False
-                    self._stop_processing_live()
-                    self._stop_subagent_live()
-                    with self._print_lock:
-                        if self._clear_screen_callback is not None:
-                            try:
-                                self._clear_screen_callback()
-                            except Exception as exc:
-                                logger.debug(
-                                    "clear_screen_callback raised in verbose toggle: %s",
-                                    exc,
-                                    exc_info=True,
-                                )
-                        else:
-                            self.display.console.clear()
-                            sys.stdout.write("\033[3J")
-                            sys.stdout.flush()
-                        if self._clear_header_callback is not None:
-                            try:
-                                self._clear_header_callback()
-                            except Exception as exc:
-                                logger.debug(
-                                    "clear_header_callback raised in compact toggle: %s",
-                                    exc,
-                                    exc_info=True,
-                                )
-                        self.display.console.print("[bold bright_black]  \u23af switched to compact mode \u23af[/]")
-                    self._reprint_history(verbose=self._verbose)
-                    # Restart Live for any remaining active subagent groups.
-                    # In TUI mode the pinned region re-draws from LiveDisplayState
-                    # on its own; explicit re-emission handles non-TUI Rich Live.
-                    if self._subagent_groups:
-                        with self._print_lock:
-                            self._update_subagent_groups_live()
+                self._apply_verbose_toggle()
 
             if not self._paused and not self._verbose_frozen:
                 if self._tui_mode:
@@ -672,12 +603,71 @@ class InlineStreamingContext:
                     self._repaint_live()
             self._stop_event.wait(timeout=0.25)
 
+    # -- verbose toggle (Ctrl+O) -------------------------------------------
+
+    def _clear_screen_for_toggle(self, mode_label: str) -> None:
+        """Wipe the screen and pinned header ahead of a Ctrl+O rebuild.
+
+        Callers hold ``_print_lock``. Callback failures are non-fatal: a stale
+        screen is far better than losing the rebuilt transcript underneath it.
+        """
+        if self._clear_screen_callback is not None:
+            try:
+                self._clear_screen_callback()
+            except Exception as exc:
+                logger.debug("clear_screen_callback raised in %s toggle: %s", mode_label, exc, exc_info=True)
+        else:
+            self.display.console.clear()
+            sys.stdout.write("\033[3J")
+            sys.stdout.flush()
+        if self._clear_header_callback is not None:
+            try:
+                self._clear_header_callback()
+            except Exception as exc:
+                logger.debug("clear_header_callback raised in %s toggle: %s", mode_label, exc, exc_info=True)
+
+    def _apply_verbose_toggle(self) -> None:
+        """Flip the display mode and rebuild the screen for it.
+
+        Verbose freezes the transcript into a static snapshot (all Live
+        displays stay down); compact unfreezes and hands the pinned region back
+        to the Live painter.
+        """
+        self._verbose = not self._verbose
+        # Blank the pinned region through the freeze flag rather than
+        # ``_stop_processing_live``: that would drop ``_processing_action`` and
+        # strand an in-flight tool. Its PROCESSING entry was already consumed
+        # by ``_process_actions`` and the reprinted history slice skips
+        # PROCESSING rows, so nothing would ever redraw the frame — the tool
+        # would silently vanish until it returned. Keeping the state intact
+        # also lets the compact side re-pin it for free.
+        self._verbose_frozen = self._verbose
+        self._repaint_live()
+        mode_label = "verbose" if self._verbose else "compact"
+        banner = "switched to verbose mode (frozen)" if self._verbose else "switched to compact mode"
+        with self._print_lock:
+            self._clear_screen_for_toggle(mode_label)
+            self.display.console.print(f"[bold bright_black]  \u23af {banner} \u23af[/]")
+
+        if self._verbose:
+            # Frozen: no Live display is restarted, so the running tool has to
+            # be part of the static snapshot.
+            self._reprint_history(verbose=True, show_active_groups=True, running_action=self._processing_action)
+            return
+
+        self._reprint_history(verbose=False)
+        # Hand the pinned region back to the Live painter, which redraws the
+        # running-tool frame / subagent rolling window from the state that
+        # survived the freeze.
+        self._repaint_live()
+
     # -- unified reprint history -------------------------------------------
 
     def _reprint_history(
         self,
         verbose: bool,
         show_active_groups: bool = False,
+        running_action: Optional[ActionHistory] = None,
     ) -> None:
         """Unified reprint of all already-processed actions.
 
@@ -688,6 +678,11 @@ class InlineStreamingContext:
             verbose: Whether to render in verbose mode (True=expanded, False=collapsed).
             show_active_groups: If True, render active subagent groups as static output
                 with an "in progress" indicator (used for verbose/frozen snapshot).
+            running_action: Main-agent tool still in flight, if any. Rendered as
+                static output at the end of the snapshot because the reprint
+                replaces the pinned region that normally carries its blinking
+                frame. ``render_action_history`` skips PROCESSING rows, so this
+                is the only way an in-flight tool survives the rebuild.
         """
         with self._print_lock:
             # 1. Render previous turns (with per-turn response rendering)
@@ -716,16 +711,26 @@ class InlineStreamingContext:
                         ):
                             continue
                         if a.action_type.endswith("_response") and a.action_type != "response":
-                            wrapper = a
-                            break
+                            if wrapper is None:
+                                wrapper = a
+                            continue
                         if a.action_type == "response" and plain is None:
                             plain = a
-                    chosen = wrapper or plain
-                    if chosen is not None:
-                        self.display.renderer.print_renderables(
-                            self.display.console,
-                            self.display.renderer.render_main_action(chosen, verbose=verbose),
-                        )
+                    # Pick the first candidate that actually carries a body.
+                    # A wrapper whose node result has no text body would
+                    # otherwise render its boilerplate ``messages`` ("chat
+                    # interaction completed successfully") in place of the
+                    # turn's answer, since ``render_action_history`` already
+                    # dropped the plain ``response`` that holds the real text.
+                    body = ""
+                    for candidate in (wrapper, plain):
+                        if candidate is None:
+                            continue
+                        body = resolve_assistant_body(candidate)
+                        if body:
+                            break
+                    if body:
+                        self.display.console.print(render_assistant_response_markdown(body))
 
                 self.display.render_multi_turn_history(
                     self._history_turns, verbose=verbose, per_turn_callback=_render_turn_response
@@ -798,6 +803,14 @@ class InlineStreamingContext:
                             self.display.console,
                             self.display.renderer.render_subagent_action(buffered, verbose=True),
                         )
+                    # The subagent's own in-flight tool lives in the pinned
+                    # rolling window (``_build_subagent_live_lines``), which the
+                    # frozen snapshot replaces — re-emit it as static output.
+                    group_processing = group.get("processing_action")
+                    if group_processing is not None:
+                        self.display.console.print(
+                            self.display.renderer.render_processing(group_processing, _PROCESSING_SYMBOL)
+                        )
                     # Show "in progress" indicator
                     dur_str = ""
                     if group["start_time"]:
@@ -806,6 +819,14 @@ class InlineStreamingContext:
                     self.display.console.print(
                         f"[dim]  \u23bf  \u23f3 in progress ({group['tool_count']} tool uses{dur_str})...[/dim]"
                     )
+            # 5. Re-emit the main-agent tool that is still running, so the
+            # snapshot ends where the user's attention was instead of dropping
+            # the call until it returns.
+            if running_action is not None:
+                self.display.renderer.print_renderables(
+                    self.display.console,
+                    self.display.renderer.render_running_tool(running_action, _PROCESSING_SYMBOL, verbose),
+                )
 
     # -- core processing (async mode) --------------------------------------
 

@@ -2410,6 +2410,28 @@ class AgenticNode(Node):
             return []
         return [pattern.strip() for pattern in patterns.split(",") if pattern.strip()]
 
+    def _get_database_skill_candidates(self) -> List[str]:
+        """Return conventional skill names for the configured database types."""
+        if not self.agent_config:
+            return []
+        getter = getattr(self.agent_config, "current_db_configs", None)
+        try:
+            configs = getter() if callable(getter) else getattr(self.agent_config, "datasource_configs", {})
+        except Exception as exc:
+            logger.debug("Failed to read database configs for skill candidates: %s", exc)
+            return []
+        if not isinstance(configs, dict):
+            return []
+
+        candidates = []
+        for config in configs.values():
+            db_type = config.get("type", "") if isinstance(config, dict) else getattr(config, "type", "")
+            db_type = getattr(db_type, "value", db_type)
+            normalized = str(db_type or "").strip().lower().replace("_", "-")
+            if normalized:
+                candidates.append(f"db-{normalized}-sql")
+        return list(dict.fromkeys(candidates))
+
     def _inject_required_skills(self, base_prompt: str) -> str:
         """Append required-skill content to the system prompt deterministically.
 
@@ -2425,7 +2447,8 @@ class AgenticNode(Node):
                 fails fast instead.
         """
         required_skills = self._get_required_skills()
-        if not required_skills:
+        database_candidates = self._get_database_skill_candidates()
+        if not required_skills and not database_candidates:
             return base_prompt
 
         if not self.skill_manager:
@@ -2439,8 +2462,17 @@ class AgenticNode(Node):
 
         from xml.sax.saxutils import quoteattr as xml_quoteattr
 
+        # Database skills follow a convention but remain adapter-optional. Only
+        # inject candidates actually contributed by an installed adapter; class-
+        # declared required skills retain their fail-fast contract.
+        database_skills = [name for name in database_candidates if self.skill_manager.get_skill(name) is not None]
+        skills_to_inject = list(dict.fromkeys([*required_skills, *database_skills]))
+        if not skills_to_inject:
+            return base_prompt
+
+        required_skill_names = set(required_skills)
         sections = []
-        for skill_name in required_skills:
+        for skill_name in skills_to_inject:
             success, message, content = self.skill_manager.load_skill(
                 skill_name,
                 self.get_node_name(),
@@ -2448,6 +2480,9 @@ class AgenticNode(Node):
                 node_class=self.get_node_class_name(),
             )
             if not success or not content:
+                if skill_name not in required_skill_names:
+                    logger.debug("Skipping optional database skill '%s': %s", skill_name, message)
+                    continue
                 from datus.utils.exceptions import DatusException, ErrorCode
 
                 raise DatusException(
@@ -2462,6 +2497,8 @@ class AgenticNode(Node):
             sections.append(f"<required_skill name={xml_quoteattr(skill_name)}>\n{content}\n</required_skill>")
             logger.info(f"Injected required skill '{skill_name}' into system prompt for '{self.get_node_name()}'")
 
+        if not sections:
+            return base_prompt
         return base_prompt + "\n\n" + "\n\n".join(sections)
 
     @staticmethod
@@ -2516,6 +2553,55 @@ class AgenticNode(Node):
         except Exception as e:
             logger.error(f"Failed to setup ask_user tool: {e}")
             self.ask_user_tool = None
+
+    def _setup_task_result_tool(self):
+        """Setup the structured task-outcome tool, for orchestrator-driven runs.
+
+        Only wired up when the request declared an orchestrator origin: an
+        ordinary IDE chat has a human reading the answer and no need to declare
+        an outcome. The caller reads the resulting tool call off the stream and
+        stops the run, so this is effectively how such a run ends.
+        """
+        if getattr(self.agent_config, "_request_origin", None) != "orchestrator":
+            self.task_result_tool = None
+            return
+
+        try:
+            from datus.tools.func_tool.task_result_tools import TaskResultTool
+
+            self.task_result_tool = TaskResultTool()
+            if self.tools is not None:
+                self.tools.extend(self.task_result_tool.available_tools())
+            self._allow_task_result_tool()
+            logger.debug("Setup submit_task_result tool")
+        except Exception as e:
+            logger.error(f"Failed to setup task result tool: {e}")
+            self.task_result_tool = None
+
+    def _allow_task_result_tool(self) -> None:
+        """Exempt ``submit_task_result`` from the permission prompt.
+
+        Same reasoning as ``ask_user``: this is the channel the run reports
+        through, not a resource it touches. Under ``normal`` / ``auto`` it
+        matches no ALLOW rule and lands on ``default=ASK``, so a finished
+        dispatch stopped to ask permission to say it had finished — and the
+        card sat in the thread waiting for a human.
+
+        Declared here rather than in ``profiles.py`` because the tool itself is
+        injected here, only for orchestrator origins. A rule in the shared
+        profiles would outlive the tool and name it for every other caller.
+        ``add_persistent_rule`` so a later ``/profile`` switch, which rebuilds
+        ``global_config``, does not drop it.
+        """
+        if self.permission_manager is None:
+            return
+
+        from datus.tools.permission.permission_config import PermissionLevel, PermissionRule
+
+        category = getattr(self.task_result_tool, "permission_category", "tools")
+        self.permission_manager.add_persistent_rule(
+            PermissionRule(tool=category, pattern="submit_task_result", permission=PermissionLevel.ALLOW)
+        )
 
     def _setup_sub_agent_task_tool(self):
         """Setup SubAgentTaskTool based on subagents config or node default.
